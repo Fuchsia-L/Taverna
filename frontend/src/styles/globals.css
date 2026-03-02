@@ -1,0 +1,133 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --radius: 0.75rem;
+}
+
+[data-theme="cyber"] {
+  --background: 255 57% 5%;
+  --foreground: 273 100% 96%;
+  --card: 259 62% 10%;
+  --card-foreground: 273 100% 96%;
+  --primary: 278 100% 57%;
+  --primary-foreground: 255 57% 5%;
+  --muted: 269 62% 78%;
+  --muted-foreground: 269 62% 78%;
+  --border: 271 76% 53%;
+
+  --app-bg: 255 57% 5%;
+  --app-surface: 259 62% 10%;
+  --app-surface-alt: 257 62% 15%;
+  --app-text: 273 100% 96%;
+  --app-muted: 269 62% 78%;
+  --app-border: 271 76% 53%;
+  --app-accent: 278 100% 57%;
+  --app-accent-alt: 312 100% 58%;
+  --app-info: 184 100% 54%;
+  --app-user-from: 271 76% 53%;
+  --app-user-to: 278 100% 57%;
+  --app-shadow-neon: 0 0 18px hsl(var(--app-accent) / 0.45), inset 0 0 16px hsl(var(--app-info) / 0.15);
+  --app-shadow-neon-soft: 0 0 14px hsl(var(--app-info) / 0.35);
+  --app-shadow-teacher: 0 4px 20px hsl(0 0% 0% / 0.3);
+  --app-shadow-student: 0 4px 20px hsl(var(--app-accent) / 0.25);
+  --app-shadow-avatar-teacher: 0 0 12px hsl(var(--app-info) / 0.25);
+  --app-shadow-avatar-student: 0 0 12px hsl(var(--app-accent-alt) / 0.3);
+  --app-shadow-composer-focus: 0 0 25px hsl(var(--app-info) / 0.2);
+}
+
+[data-theme="ember"] {
+  --background: 20 45% 5%;
+  --foreground: 36 100% 96%;
+  --card: 24 55% 10%;
+  --card-foreground: 36 100% 96%;
+  --primary: 16 100% 55%;
+  --primary-foreground: 20 45% 5%;
+  --muted: 32 45% 78%;
+  --muted-foreground: 32 45% 78%;
+  --border: 14 85% 48%;
+
+  --app-bg: 20 45% 5%;
+  --app-surface: 24 55% 10%;
+  --app-surface-alt: 26 58% 14%;
+  --app-text: 36 100% 96%;
+  --app-muted: 32 45% 78%;
+  --app-border: 14 85% 48%;
+  --app-accent: 16 100% 55%;
+  --app-accent-alt: 342 100% 62%;
+  --app-info: 188 100% 45%;
+  --app-user-from: 14 85% 48%;
+  --app-user-to: 16 100% 55%;
+  --app-shadow-neon: 0 0 18px hsl(var(--app-accent) / 0.5), inset 0 0 16px hsl(var(--app-info) / 0.18);
+  --app-shadow-neon-soft: 0 0 14px hsl(var(--app-info) / 0.4);
+  --app-shadow-teacher: 0 4px 22px hsl(20 45% 3% / 0.35);
+  --app-shadow-student: 0 4px 22px hsl(var(--app-accent) / 0.3);
+  --app-shadow-avatar-teacher: 0 0 14px hsl(var(--app-info) / 0.28);
+  --app-shadow-avatar-student: 0 0 14px hsl(var(--app-accent-alt) / 0.35);
+  --app-shadow-composer-focus: 0 0 28px hsl(var(--app-info) / 0.22);
+}
+
+* {
+  @apply border-border;
+}
+
+body {
+  @apply bg-background text-foreground;
+  margin: 0;
+  min-height: 100vh;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+@layer utilities {
+  .cyber-bg {
+    background-image:
+      linear-gradient(hsl(var(--app-accent) / 0.06) 1px, transparent 1px),
+      linear-gradient(90deg, hsl(var(--app-info) / 0.06) 1px, transparent 1px);
+    background-size: 40px 40px;
+    animation: grid-drift 4s linear infinite;
+  }
+
+  .cyber-focus-radial {
+    background-image: radial-gradient(circle at center, transparent 0%, hsl(var(--app-bg)) 85%);
+  }
+
+  .app-select {
+    color-scheme: dark;
+    background-color: hsl(var(--app-surface-alt) / 0.85);
+    color: hsl(var(--app-text));
+  }
+
+  .app-select option {
+    background-color: hsl(var(--app-surface));
+    color: hsl(var(--app-text));
+  }
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--app-accent) / 0.35);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--app-accent) / 0.55);
+}
+
+.katex {
+  color: inherit;
+  font-size: 1em;
+}
+
+.katex-display {
+  margin: 0.7em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}

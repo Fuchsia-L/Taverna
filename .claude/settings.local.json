@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs grep -l \"streaming\\\\|isResponding\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''api/chat.py'', doraise=True\\); print\\(''chat.py: OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''api/chat.py'', doraise=True\\); print\\(''Backend OK''\\)\")",
+      "Bash(npx tsc --noEmit)",
+      "Bash(cat \"d:/_PROJECTS/Taverna/frontend/src/services/\"*.ts)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''models/chat.py'', doraise=True\\); py_compile.compile\\(''api/chat.py'', doraise=True\\); print\\(''Backend OK''\\)\")"
+    ]
+  }
+}
