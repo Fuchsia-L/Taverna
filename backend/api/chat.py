@@ -1095,6 +1095,7 @@ async def tool_response(req: ToolResponseRequest, response: Response) -> ChatOrT
         tool_name = str(pending.get("tool_name", ""))
         answers_text = _format_answers_readable(tool_name, req.answers)
         await clear_pending_tool(conversation_id)
+        await add_message("user", answers_text, conversation_id)
         record_debug_request(conversation_id, model, messages, turn_index=await get_current_user_turn(conversation_id))
 
         try:
@@ -1116,7 +1117,6 @@ async def tool_response(req: ToolResponseRequest, response: Response) -> ChatOrT
             if tool_student_text and tool_student_text not in (reply or ""):
                 reply = f"{tool_student_text}\n\n{reply or ''}".strip()
             reply = _merge_probe_thinking(reply or "", probe_reasoning)
-            await add_message("user", answers_text, conversation_id)
             await _save_assistant_and_debug(
                 conversation_id,
                 reply,
@@ -1183,6 +1183,7 @@ async def tool_response_stream(req: ToolResponseRequest, request: Request) -> St
         }
     )
     await clear_pending_tool(conversation_id)
+    await add_message("user", answers_text, conversation_id)
     record_debug_request(conversation_id, model, base_messages, turn_index=await get_current_user_turn(conversation_id))
 
     async def event_generator() -> AsyncGenerator[str, None]:
@@ -1252,7 +1253,6 @@ async def tool_response_stream(req: ToolResponseRequest, request: Request) -> St
                 yield _sse_payload({"type": "token", "content": timeout_note})
 
             saved = True
-            await add_message("user", answers_text, conversation_id)
             await _save_assistant_and_debug(
                 conversation_id,
                 full_reply,
