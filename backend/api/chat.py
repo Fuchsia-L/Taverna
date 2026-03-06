@@ -24,6 +24,7 @@ from core.conversation import (
     remove_last_assistant,
     rewind_to_user_turn,
 )
+from core.concurrency import conversation_guard
 from core.pending_tools import clear_pending_tool, get_pending_tool, set_pending_tool
 from core.providers import get_sync_client_for_model, get_thinking_extra_params, resolve_model
 from core.teaching_engine import clear_plan, get_plan, get_teaching_context
@@ -45,6 +46,13 @@ load_dotenv()
 _teacher_soul = load_soul("teacher_socratic.md")
 _FALLBACK_REPLY = "⚠️ AI暂时无法回应，请稍后再试。"
 _TOOL_LOOP_LIMIT = 5
+
+
+async def _guarded_stream(conversation_id: str, gen: AsyncGenerator[str, None]) -> AsyncGenerator[str, None]:
+    """Wrap an SSE generator so conversation_guard is held for its entire lifetime."""
+    async with conversation_guard(conversation_id):
+        async for item in gen:
+            yield item
 
 
 def _resolve_model(req_model: str | None) -> str:
@@ -750,35 +758,36 @@ async def chat(req: ChatRequest, response: Response) -> ChatOrToolResponse:
     response.headers["X-Conversation-Id"] = conversation_id
     model = _resolve_model(req.model)
 
-    try:
-        # If a previous interactive tool was pending and the student sends a new message,
-        # treat it as a fresh turn.
-        await clear_pending_tool(conversation_id)
-        await add_message("user", _build_user_content(req.message, req.images), conversation_id)
-        messages = await _build_messages(conversation_id)
-        record_debug_request(conversation_id, model, messages, turn_index=await get_current_user_turn(conversation_id))
+    async with conversation_guard(conversation_id):
+        try:
+            # If a previous interactive tool was pending and the student sends a new message,
+            # treat it as a fresh turn.
+            await clear_pending_tool(conversation_id)
+            await add_message("user", _build_user_content(req.message, req.images), conversation_id)
+            messages = await _build_messages(conversation_id)
+            record_debug_request(conversation_id, model, messages, turn_index=await get_current_user_turn(conversation_id))
 
-        _, reply, raw, tool_trace, _, probe_reasoning, force_compress, pending = await _run_tool_loop(
-            messages, model, conversation_id, thinking=req.thinking
-        )
-        if pending:
-            partial_reply = _merge_probe_thinking(reply or "", probe_reasoning)
-            return ChatOrToolResponse(reply=partial_reply, tool_input_required=pending)
-        tool_student_text = _build_tool_student_text(tool_trace)
-        if tool_student_text and tool_student_text not in reply:
-            reply = f"{tool_student_text}\n\n{reply}".strip()
-        reply = _merge_probe_thinking(reply, probe_reasoning)
-        wrapped_raw = {
-            "assistant_text": reply,
-            "final_response": raw,
-            "tool_rounds": tool_trace,
-            "probe_reasoning": probe_reasoning,
-        }
-        await _save_assistant_and_debug(conversation_id, reply, wrapped_raw, force_compress=force_compress)
-    except Exception:
-        reply = _FALLBACK_REPLY
+            _, reply, raw, tool_trace, _, probe_reasoning, force_compress, pending = await _run_tool_loop(
+                messages, model, conversation_id, thinking=req.thinking
+            )
+            if pending:
+                partial_reply = _merge_probe_thinking(reply or "", probe_reasoning)
+                return ChatOrToolResponse(reply=partial_reply, tool_input_required=pending)
+            tool_student_text = _build_tool_student_text(tool_trace)
+            if tool_student_text and tool_student_text not in reply:
+                reply = f"{tool_student_text}\n\n{reply}".strip()
+            reply = _merge_probe_thinking(reply, probe_reasoning)
+            wrapped_raw = {
+                "assistant_text": reply,
+                "final_response": raw,
+                "tool_rounds": tool_trace,
+                "probe_reasoning": probe_reasoning,
+            }
+            await _save_assistant_and_debug(conversation_id, reply, wrapped_raw, force_compress=force_compress)
+        except Exception:
+            reply = _FALLBACK_REPLY
 
-    return ChatOrToolResponse(reply=reply)
+        return ChatOrToolResponse(reply=reply)
 
 
 @router.post("/chat/stream")
@@ -987,7 +996,7 @@ async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
                     pass
 
     return StreamingResponse(
-        event_generator(),
+        _guarded_stream(conversation_id, event_generator()),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -1038,9 +1047,10 @@ async def debug_info(conversation_id: str | None = Query(default=None)) -> dict:
 @router.post("/chat/clear")
 async def clear_chat(conversation_id: str | None = Query(default=None)) -> dict:
     resolved_session = await ensure_session(conversation_id)
-    await clear_history(resolved_session)
-    await clear_plan(resolved_session)
-    await clear_pending_tool(resolved_session)
+    async with conversation_guard(resolved_session):
+        await clear_history(resolved_session)
+        await clear_plan(resolved_session)
+        await clear_pending_tool(resolved_session)
     return {"status": "ok", "conversation_id": resolved_session}
 
 
@@ -1048,60 +1058,62 @@ async def clear_chat(conversation_id: str | None = Query(default=None)) -> dict:
 async def tool_response(req: ToolResponseRequest, response: Response) -> ChatOrToolResponse:
     conversation_id = await ensure_session(req.conversation_id)
     response.headers["X-Conversation-Id"] = conversation_id
-    pending = await get_pending_tool(conversation_id)
-    if not pending:
-        return ChatOrToolResponse(reply="⚠️ 当前没有待回答的工具问题。")
-    if pending.get("tool_call_id") != req.tool_call_id:
-        return ChatOrToolResponse(reply="⚠️ 工具调用ID不匹配。")
 
-    model = _resolve_model(req.model)
-    messages = list(pending.get("messages", []))
-    messages.append(
-        {
-            "role": "tool",
-            "tool_call_id": req.tool_call_id,
-            "content": _format_answers(str(pending.get("tool_name", "")), req.answers),
-        }
-    )
-    tool_name = str(pending.get("tool_name", ""))
-    answers_text = _format_answers_readable(tool_name, req.answers)
-    await clear_pending_tool(conversation_id)
-    record_debug_request(conversation_id, model, messages, turn_index=await get_current_user_turn(conversation_id))
+    async with conversation_guard(conversation_id):
+        pending = await get_pending_tool(conversation_id)
+        if not pending:
+            return ChatOrToolResponse(reply="⚠️ 当前没有待回答的工具问题。")
+        if pending.get("tool_call_id") != req.tool_call_id:
+            return ChatOrToolResponse(reply="⚠️ 工具调用ID不匹配。")
 
-    try:
-        (
-            _,
-            reply,
-            raw,
-            tool_trace,
-            _,
-            probe_reasoning,
-            force_compress,
-            new_pending,
-        ) = await _run_tool_loop(messages, model, conversation_id, thinking=req.thinking)
-        if new_pending:
-            partial_reply = _merge_probe_thinking(reply or "", probe_reasoning)
-            return ChatOrToolResponse(reply=partial_reply, tool_input_required=new_pending)
-
-        tool_student_text = _build_tool_student_text(tool_trace)
-        if tool_student_text and tool_student_text not in (reply or ""):
-            reply = f"{tool_student_text}\n\n{reply or ''}".strip()
-        reply = _merge_probe_thinking(reply or "", probe_reasoning)
-        await add_message("user", answers_text, conversation_id)
-        await _save_assistant_and_debug(
-            conversation_id,
-            reply,
+        model = _resolve_model(req.model)
+        messages = list(pending.get("messages", []))
+        messages.append(
             {
-                "assistant_text": reply,
-                "final_response": raw,
-                "tool_rounds": tool_trace,
-                "probe_reasoning": probe_reasoning,
-            },
-            force_compress=force_compress,
+                "role": "tool",
+                "tool_call_id": req.tool_call_id,
+                "content": _format_answers(str(pending.get("tool_name", "")), req.answers),
+            }
         )
-        return ChatOrToolResponse(reply=reply)
-    except Exception:
-        return ChatOrToolResponse(reply=_FALLBACK_REPLY)
+        tool_name = str(pending.get("tool_name", ""))
+        answers_text = _format_answers_readable(tool_name, req.answers)
+        await clear_pending_tool(conversation_id)
+        record_debug_request(conversation_id, model, messages, turn_index=await get_current_user_turn(conversation_id))
+
+        try:
+            (
+                _,
+                reply,
+                raw,
+                tool_trace,
+                _,
+                probe_reasoning,
+                force_compress,
+                new_pending,
+            ) = await _run_tool_loop(messages, model, conversation_id, thinking=req.thinking)
+            if new_pending:
+                partial_reply = _merge_probe_thinking(reply or "", probe_reasoning)
+                return ChatOrToolResponse(reply=partial_reply, tool_input_required=new_pending)
+
+            tool_student_text = _build_tool_student_text(tool_trace)
+            if tool_student_text and tool_student_text not in (reply or ""):
+                reply = f"{tool_student_text}\n\n{reply or ''}".strip()
+            reply = _merge_probe_thinking(reply or "", probe_reasoning)
+            await add_message("user", answers_text, conversation_id)
+            await _save_assistant_and_debug(
+                conversation_id,
+                reply,
+                {
+                    "assistant_text": reply,
+                    "final_response": raw,
+                    "tool_rounds": tool_trace,
+                    "probe_reasoning": probe_reasoning,
+                },
+                force_compress=force_compress,
+            )
+            return ChatOrToolResponse(reply=reply)
+        except Exception:
+            return ChatOrToolResponse(reply=_FALLBACK_REPLY)
 
 
 @router.post("/chat/tool-response/stream")
@@ -1250,7 +1262,7 @@ async def tool_response_stream(req: ToolResponseRequest, request: Request) -> St
                     pass
 
     return StreamingResponse(
-        event_generator(),
+        _guarded_stream(conversation_id, event_generator()),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Conversation-Id": conversation_id},
     )
@@ -1261,33 +1273,35 @@ async def retry(req: RetryRequest, response: Response) -> ChatOrToolResponse:
     conversation_id = await ensure_session(req.conversation_id)
     response.headers["X-Conversation-Id"] = conversation_id
     model = _resolve_model(req.model)
-    await clear_pending_tool(conversation_id)
 
-    try:
-        messages = await _prepare_retry_context(conversation_id)
-        record_debug_request(conversation_id, model, messages, turn_index=await get_current_user_turn(conversation_id))
+    async with conversation_guard(conversation_id):
+        await clear_pending_tool(conversation_id)
 
-        _, reply, raw, tool_trace, _, probe_reasoning, force_compress, pending = await _run_tool_loop(
-            messages, model, conversation_id, thinking=req.thinking
-        )
-        if pending:
-            partial_reply = _merge_probe_thinking(reply or "", probe_reasoning)
-            return ChatOrToolResponse(reply=partial_reply, tool_input_required=pending)
-        tool_student_text = _build_tool_student_text(tool_trace)
-        if tool_student_text and tool_student_text not in reply:
-            reply = f"{tool_student_text}\n\n{reply}".strip()
-        reply = _merge_probe_thinking(reply, probe_reasoning)
-        wrapped_raw = {
-            "assistant_text": reply,
-            "final_response": raw,
-            "tool_rounds": tool_trace,
-            "probe_reasoning": probe_reasoning,
-        }
-        await _save_assistant_and_debug(conversation_id, reply, wrapped_raw, force_compress=force_compress)
-    except Exception:
-        reply = _FALLBACK_REPLY
+        try:
+            messages = await _prepare_retry_context(conversation_id)
+            record_debug_request(conversation_id, model, messages, turn_index=await get_current_user_turn(conversation_id))
 
-    return ChatOrToolResponse(reply=reply)
+            _, reply, raw, tool_trace, _, probe_reasoning, force_compress, pending = await _run_tool_loop(
+                messages, model, conversation_id, thinking=req.thinking
+            )
+            if pending:
+                partial_reply = _merge_probe_thinking(reply or "", probe_reasoning)
+                return ChatOrToolResponse(reply=partial_reply, tool_input_required=pending)
+            tool_student_text = _build_tool_student_text(tool_trace)
+            if tool_student_text and tool_student_text not in reply:
+                reply = f"{tool_student_text}\n\n{reply}".strip()
+            reply = _merge_probe_thinking(reply, probe_reasoning)
+            wrapped_raw = {
+                "assistant_text": reply,
+                "final_response": raw,
+                "tool_rounds": tool_trace,
+                "probe_reasoning": probe_reasoning,
+            }
+            await _save_assistant_and_debug(conversation_id, reply, wrapped_raw, force_compress=force_compress)
+        except Exception:
+            reply = _FALLBACK_REPLY
+
+        return ChatOrToolResponse(reply=reply)
 
 
 @router.post("/chat/retry/stream")
@@ -1487,7 +1501,7 @@ async def retry_stream(req: RetryRequest, request: Request) -> StreamingResponse
                     pass
 
     return StreamingResponse(
-        event_generator(),
+        _guarded_stream(conversation_id, event_generator()),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -1502,33 +1516,35 @@ async def rewind(req: RewindRequest, response: Response) -> ChatOrToolResponse:
     conversation_id = await ensure_session(req.conversation_id)
     response.headers["X-Conversation-Id"] = conversation_id
     model = _resolve_model(req.model)
-    await clear_pending_tool(conversation_id)
 
-    try:
-        messages = await _prepare_rewind_context(conversation_id, req)
-        record_debug_request(conversation_id, model, messages, turn_index=req.target_user_turn)
+    async with conversation_guard(conversation_id):
+        await clear_pending_tool(conversation_id)
 
-        _, reply, raw, tool_trace, _, probe_reasoning, force_compress, pending = await _run_tool_loop(
-            messages, model, conversation_id, thinking=req.thinking
-        )
-        if pending:
-            partial_reply = _merge_probe_thinking(reply or "", probe_reasoning)
-            return ChatOrToolResponse(reply=partial_reply, tool_input_required=pending)
-        tool_student_text = _build_tool_student_text(tool_trace)
-        if tool_student_text and tool_student_text not in reply:
-            reply = f"{tool_student_text}\n\n{reply}".strip()
-        reply = _merge_probe_thinking(reply, probe_reasoning)
-        wrapped_raw = {
-            "assistant_text": reply,
-            "final_response": raw,
-            "tool_rounds": tool_trace,
-            "probe_reasoning": probe_reasoning,
-        }
-        await _save_assistant_and_debug(conversation_id, reply, wrapped_raw, force_compress=force_compress)
-    except Exception:
-        reply = _FALLBACK_REPLY
+        try:
+            messages = await _prepare_rewind_context(conversation_id, req)
+            record_debug_request(conversation_id, model, messages, turn_index=req.target_user_turn)
 
-    return ChatOrToolResponse(reply=reply)
+            _, reply, raw, tool_trace, _, probe_reasoning, force_compress, pending = await _run_tool_loop(
+                messages, model, conversation_id, thinking=req.thinking
+            )
+            if pending:
+                partial_reply = _merge_probe_thinking(reply or "", probe_reasoning)
+                return ChatOrToolResponse(reply=partial_reply, tool_input_required=pending)
+            tool_student_text = _build_tool_student_text(tool_trace)
+            if tool_student_text and tool_student_text not in reply:
+                reply = f"{tool_student_text}\n\n{reply}".strip()
+            reply = _merge_probe_thinking(reply, probe_reasoning)
+            wrapped_raw = {
+                "assistant_text": reply,
+                "final_response": raw,
+                "tool_rounds": tool_trace,
+                "probe_reasoning": probe_reasoning,
+            }
+            await _save_assistant_and_debug(conversation_id, reply, wrapped_raw, force_compress=force_compress)
+        except Exception:
+            reply = _FALLBACK_REPLY
+
+        return ChatOrToolResponse(reply=reply)
 
 
 @router.post("/chat/rewind/stream")
@@ -1728,7 +1744,7 @@ async def rewind_stream(req: RewindRequest, request: Request) -> StreamingRespon
                     pass
 
     return StreamingResponse(
-        event_generator(),
+        _guarded_stream(conversation_id, event_generator()),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
