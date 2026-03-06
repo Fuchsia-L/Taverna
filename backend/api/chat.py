@@ -994,6 +994,13 @@ async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
                     )
                 except Exception:
                     pass
+            # Guarantee a done event so the frontend can always finalize.
+            if not saved and not paused:
+                try:
+                    if not await request.is_disconnected():
+                        yield _sse_payload({"type": "done", "conversation_id": conversation_id})
+                except Exception:
+                    pass
 
     return StreamingResponse(
         _guarded_stream(conversation_id, event_generator()),
@@ -1123,6 +1130,7 @@ async def tool_response_stream(req: ToolResponseRequest, request: Request) -> St
     if not pending:
         async def no_pending() -> AsyncGenerator[str, None]:
             yield _sse_payload({"type": "error", "message": "No pending tool call", "conversation_id": conversation_id})
+            yield _sse_payload({"type": "done", "conversation_id": conversation_id})
         return StreamingResponse(
             no_pending(),
             media_type="text/event-stream",
@@ -1131,6 +1139,7 @@ async def tool_response_stream(req: ToolResponseRequest, request: Request) -> St
     if pending.get("tool_call_id") != req.tool_call_id:
         async def bad_id() -> AsyncGenerator[str, None]:
             yield _sse_payload({"type": "error", "message": "tool_call_id mismatch", "conversation_id": conversation_id})
+            yield _sse_payload({"type": "done", "conversation_id": conversation_id})
         return StreamingResponse(
             bad_id(),
             media_type="text/event-stream",
@@ -1260,6 +1269,13 @@ async def tool_response_stream(req: ToolResponseRequest, request: Request) -> St
                     )
                 except Exception:
                     pass
+            # Guarantee a done event so the frontend can always finalize.
+            if not saved and not paused:
+                try:
+                    if not await request.is_disconnected():
+                        yield _sse_payload({"type": "done", "conversation_id": conversation_id})
+                except Exception:
+                    pass
 
     return StreamingResponse(
         _guarded_stream(conversation_id, event_generator()),
@@ -1318,6 +1334,7 @@ async def retry_stream(req: RetryRequest, request: Request) -> StreamingResponse
 
         async def empty_retry_generator() -> AsyncGenerator[str, None]:
             yield _sse_payload({"type": "error", "message": error_message, "conversation_id": conversation_id})
+            yield _sse_payload({"type": "done", "conversation_id": conversation_id})
 
         return StreamingResponse(
             empty_retry_generator(),
@@ -1499,6 +1516,13 @@ async def retry_stream(req: RetryRequest, request: Request) -> StreamingResponse
                     )
                 except Exception:
                     pass
+            # Guarantee a done event so the frontend can always finalize.
+            if not saved and not paused:
+                try:
+                    if not await request.is_disconnected():
+                        yield _sse_payload({"type": "done", "conversation_id": conversation_id})
+                except Exception:
+                    pass
 
     return StreamingResponse(
         _guarded_stream(conversation_id, event_generator()),
@@ -1561,6 +1585,7 @@ async def rewind_stream(req: RewindRequest, request: Request) -> StreamingRespon
 
         async def bad_rewind_generator() -> AsyncGenerator[str, None]:
             yield _sse_payload({"type": "error", "message": error_message, "conversation_id": conversation_id})
+            yield _sse_payload({"type": "done", "conversation_id": conversation_id})
 
         return StreamingResponse(
             bad_rewind_generator(),
@@ -1740,6 +1765,13 @@ async def rewind_stream(req: RewindRequest, request: Request) -> StreamingRespon
                         },
                         force_compress=force_compress,
                     )
+                except Exception:
+                    pass
+            # Guarantee a done event so the frontend can always finalize.
+            if not saved and not paused:
+                try:
+                    if not await request.is_disconnected():
+                        yield _sse_payload({"type": "done", "conversation_id": conversation_id})
                 except Exception:
                     pass
 
