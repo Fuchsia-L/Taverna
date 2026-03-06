@@ -9,6 +9,7 @@ from copy import deepcopy
 from uuid import UUID, uuid4
 
 from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
 
 from core.compressor import compress_messages
 from core.token_utils import estimate_messages_tokens
@@ -47,7 +48,10 @@ async def _ensure_conversation_exists(conversation_id: str | None = None) -> str
                     title="新会话",
                 )
             )
-            await db.commit()
+            try:
+                await db.commit()
+            except IntegrityError:
+                await db.rollback()
     return resolved
 
 
@@ -168,23 +172,20 @@ async def _load_uncompressed(db, conv_uuid: UUID) -> tuple[list, Conversation | 
 async def get_recent_messages(conversation_id: str = "default") -> list[dict]:
     """Return the messages that should be sent to the AI as context.
 
-    If no summary exists yet the full (uncompressed) history is returned so the
-    model never loses context.  Once a summary exists the recent token-window
-    is applied.
+    Always returns **all** uncompressed messages (everything after the
+    compression boundary).  The summary in the system prompt covers
+    everything before the boundary, so together they give the model
+    complete context with no gaps.
+
+    ``_split_by_token_window`` is only used by ``check_and_compress``
+    to decide *what* to compress — not to trim what the model sees.
     """
-    resolved = await _ensure_conversation_exists(conversation_id)
-    conv_uuid = UUID(resolved)
+    conv_uuid = UUID(conversation_id)
 
     async with SessionLocal() as db:
         rows, conversation = await _load_uncompressed(db, conv_uuid)
 
-    history = [{"role": row.role.value, "content": row.content} for row in rows]
-
-    if not conversation or not (conversation.summary or "").strip():
-        return history
-
-    _, recent = _split_by_token_window(history)
-    return recent
+    return [{"role": row.role.value, "content": row.content} for row in rows]
 
 
 async def get_last_user_message(conversation_id: str = "default") -> str | list | None:
@@ -197,6 +198,16 @@ async def get_last_user_message(conversation_id: str = "default") -> str | list 
             .order_by(Message.created_at.desc(), Message.id.desc())
         )
         return row.content if row else None
+
+
+async def get_message_count(conversation_id: str) -> int:
+    """Return total number of messages in the conversation."""
+    conv_uuid = UUID(conversation_id)
+    async with SessionLocal() as db:
+        value = await db.scalar(
+            select(func.count(Message.id)).where(Message.conversation_id == conv_uuid)
+        )
+    return int(value or 0)
 
 
 async def get_current_user_turn(conversation_id: str = "default") -> int:
@@ -279,8 +290,19 @@ async def rewind_to_user_turn(conversation_id: str, target_user_turn: int) -> bo
 
         conversation = await db.scalar(select(Conversation).where(Conversation.id == conv_uuid))
         if conversation:
-            conversation.summary = None
-            conversation.compressed_before_id = None
+            compressed_id = conversation.compressed_before_id
+            if compressed_id is not None:
+                # Find the compression boundary position among all messages.
+                compressed_idx = next(
+                    (idx for idx, row in enumerate(rows) if row.id == compressed_id),
+                    None,
+                )
+                if compressed_idx is None or boundary_index <= compressed_idx:
+                    # Rewind target is at or before the compression boundary
+                    # — the summary references deleted messages, so invalidate it.
+                    conversation.summary = None
+                    conversation.compressed_before_id = None
+                # else: rewind target is after boundary, summary still valid.
 
         await db.commit()
 
@@ -293,13 +315,15 @@ def record_debug_request(
     model: str,
     messages: list[dict],
     turn_index: int | None = None,
-):
+) -> str:
     turns = _debug_turns.setdefault(conversation_id, [])
     resolved_turn_index = turn_index if turn_index is not None else 0
     same_turn_versions = [t for t in turns if t.get("turn_index") == resolved_turn_index]
     version_index = len(same_turn_versions) + 1
+    debug_id = str(uuid4())
     turns.append(
         {
+            "debug_id": debug_id,
             "turn_index": resolved_turn_index,
             "version_index": version_index,
             "model": model,
@@ -307,12 +331,18 @@ def record_debug_request(
             "response_raw": "",
         }
     )
+    return debug_id
 
 
-def record_debug_response(conversation_id: str, response_raw):
+def record_debug_response(conversation_id: str, response_raw, debug_id: str | None = None):
     turns = _debug_turns.setdefault(conversation_id, [])
     if not turns:
         return
+    if debug_id:
+        for turn in reversed(turns):
+            if turn.get("debug_id") == debug_id:
+                turn["response_raw"] = response_raw
+                return
     turns[-1]["response_raw"] = response_raw
 
 
@@ -363,10 +393,14 @@ async def check_and_compress(conversation_id: str = "default", force: bool = Fal
         compress_input = list(old_msgs)
         if old_summary:
             compress_input = [
-                {"role": "system", "content": f"之前的摘要：{old_summary}"}
+                {"role": "user", "content": f"[之前的摘要]\n{old_summary}"}
             ] + compress_input
 
-        new_summary = compress_messages(compress_input)
+        new_summary = await compress_messages(compress_input)
+
+        if not new_summary:
+            # Compression failed — skip updating the boundary so we retry next time.
+            return False
 
         # Update boundary marker — the last message in old_msgs.
         # old_msgs has len(old_msgs) items which map to rows[:len(old_msgs)].
@@ -376,6 +410,26 @@ async def check_and_compress(conversation_id: str = "default", force: bool = Fal
 
         await db.commit()
         return True
+
+
+async def delete_conversation(conversation_id: str) -> bool:
+    """Delete a conversation row and all associated data (cascades via DB)."""
+    try:
+        conv_uuid = UUID(conversation_id)
+    except ValueError:
+        return False
+
+    async with SessionLocal() as db:
+        conversation = await db.scalar(
+            select(Conversation).where(Conversation.id == conv_uuid)
+        )
+        if not conversation:
+            return False
+        await db.delete(conversation)
+        await db.commit()
+
+    _debug_turns.pop(conversation_id, None)
+    return True
 
 
 async def clear_history(conversation_id: str = "default"):

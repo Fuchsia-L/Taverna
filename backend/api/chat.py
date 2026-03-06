@@ -16,6 +16,7 @@ from core.conversation import (
     get_debug_turns,
     get_history,
     get_last_user_message,
+    get_message_count,
     get_recent_messages,
     get_summary,
     record_debug_request,
@@ -309,6 +310,7 @@ async def _run_tool_loop(
                             tool_call_id=tool_call.id,
                             tool_name=fn_name,
                             messages_snapshot=messages,
+                            message_count=await get_message_count(conversation_id),
                         )
                         pending_request = {
                             **handled.get("input_request", {}),
@@ -667,6 +669,7 @@ async def _process_stream_tool_calls(
                     tool_call_id=call["id"],
                     tool_name=fn_name,
                     messages_snapshot=messages,
+                    message_count=await get_message_count(conversation_id),
                 )
                 pending_request = {
                     **handled.get("input_request", {}),
@@ -1073,6 +1076,12 @@ async def tool_response(req: ToolResponseRequest, response: Response) -> ChatOrT
             return ChatOrToolResponse(reply="⚠️ 当前没有待回答的工具问题。")
         if pending.get("tool_call_id") != req.tool_call_id:
             return ChatOrToolResponse(reply="⚠️ 工具调用ID不匹配。")
+        stored_count = pending.get("message_count")
+        if stored_count is not None:
+            current_count = await get_message_count(conversation_id)
+            if current_count != stored_count:
+                await clear_pending_tool(conversation_id)
+                return ChatOrToolResponse(reply="⚠️ 会话已变更，请重新操作。")
 
         model = _resolve_model(req.model)
         messages = list(pending.get("messages", []))
@@ -1146,6 +1155,20 @@ async def tool_response_stream(req: ToolResponseRequest, request: Request) -> St
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Conversation-Id": conversation_id},
         )
+    stored_count = pending.get("message_count")
+    if stored_count is not None:
+        current_count = await get_message_count(conversation_id)
+        if current_count != stored_count:
+            await clear_pending_tool(conversation_id)
+
+            async def stale_pending() -> AsyncGenerator[str, None]:
+                yield _sse_payload({"type": "error", "message": "会话已变更，请重新操作。", "conversation_id": conversation_id})
+                yield _sse_payload({"type": "done", "conversation_id": conversation_id})
+            return StreamingResponse(
+                stale_pending(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Conversation-Id": conversation_id},
+            )
 
     model = _resolve_model(req.model)
     thinking = req.thinking
