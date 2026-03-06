@@ -795,12 +795,6 @@ async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
     conversation_id = await ensure_session(req.conversation_id)
     model = _resolve_model(req.model)
     thinking = req.thinking
-    # If a previous interactive tool was pending and the student sends a new message,
-    # treat it as a fresh turn.
-    await clear_pending_tool(conversation_id)
-    await add_message("user", _build_user_content(req.message, req.images), conversation_id)
-    base_messages = await _build_messages(conversation_id)
-    record_debug_request(conversation_id, model, base_messages, turn_index=await get_current_user_turn(conversation_id))
 
     async def event_generator() -> AsyncGenerator[str, None]:
         full_reply = ""
@@ -811,6 +805,13 @@ async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
         saved = False
         paused = False
         try:
+            # Moved inside generator so failures become SSE errors (not HTTP 500)
+            # and run under conversation_guard lock.
+            await clear_pending_tool(conversation_id)
+            await add_message("user", _build_user_content(req.message, req.images), conversation_id)
+            base_messages = await _build_messages(conversation_id)
+            record_debug_request(conversation_id, model, base_messages, turn_index=await get_current_user_turn(conversation_id))
+
             tool_trace: list[dict] = []
             messages = list(base_messages)
             tools_enabled = True
@@ -1325,28 +1326,6 @@ async def retry_stream(req: RetryRequest, request: Request) -> StreamingResponse
     conversation_id = await ensure_session(req.conversation_id)
     model = _resolve_model(req.model)
     thinking = req.thinking
-    await clear_pending_tool(conversation_id)
-
-    try:
-        base_messages = await _prepare_retry_context(conversation_id)
-    except Exception as exc:
-        error_message = str(exc)
-
-        async def empty_retry_generator() -> AsyncGenerator[str, None]:
-            yield _sse_payload({"type": "error", "message": error_message, "conversation_id": conversation_id})
-            yield _sse_payload({"type": "done", "conversation_id": conversation_id})
-
-        return StreamingResponse(
-            empty_retry_generator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Conversation-Id": conversation_id,
-            },
-        )
-
-    record_debug_request(conversation_id, model, base_messages, turn_index=await get_current_user_turn(conversation_id))
 
     async def event_generator() -> AsyncGenerator[str, None]:
         full_reply = ""
@@ -1357,6 +1336,10 @@ async def retry_stream(req: RetryRequest, request: Request) -> StreamingResponse
         saved = False
         paused = False
         try:
+            await clear_pending_tool(conversation_id)
+            base_messages = await _prepare_retry_context(conversation_id)
+            record_debug_request(conversation_id, model, base_messages, turn_index=await get_current_user_turn(conversation_id))
+
             tool_trace: list[dict] = []
             messages = list(base_messages)
             tools_enabled = True
@@ -1576,28 +1559,6 @@ async def rewind_stream(req: RewindRequest, request: Request) -> StreamingRespon
     conversation_id = await ensure_session(req.conversation_id)
     model = _resolve_model(req.model)
     thinking = req.thinking
-    await clear_pending_tool(conversation_id)
-
-    try:
-        base_messages = await _prepare_rewind_context(conversation_id, req)
-    except Exception as exc:
-        error_message = str(exc)
-
-        async def bad_rewind_generator() -> AsyncGenerator[str, None]:
-            yield _sse_payload({"type": "error", "message": error_message, "conversation_id": conversation_id})
-            yield _sse_payload({"type": "done", "conversation_id": conversation_id})
-
-        return StreamingResponse(
-            bad_rewind_generator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Conversation-Id": conversation_id,
-            },
-        )
-
-    record_debug_request(conversation_id, model, base_messages, turn_index=req.target_user_turn)
 
     async def event_generator() -> AsyncGenerator[str, None]:
         full_reply = ""
@@ -1608,6 +1569,10 @@ async def rewind_stream(req: RewindRequest, request: Request) -> StreamingRespon
         saved = False
         paused = False
         try:
+            await clear_pending_tool(conversation_id)
+            base_messages = await _prepare_rewind_context(conversation_id, req)
+            record_debug_request(conversation_id, model, base_messages, turn_index=req.target_user_turn)
+
             tool_trace: list[dict] = []
             messages = list(base_messages)
             tools_enabled = True
