@@ -1,13 +1,11 @@
 import asyncio
 import json
-import os
 import re
 from collections.abc import AsyncGenerator, Iterator
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import StreamingResponse
-from openai import OpenAI
 
 from core.conversation import (
     add_message,
@@ -27,6 +25,7 @@ from core.conversation import (
     rewind_to_user_turn,
 )
 from core.pending_tools import clear_pending_tool, get_pending_tool, set_pending_tool
+from core.providers import get_sync_client_for_model, get_thinking_extra_params, resolve_model
 from core.teaching_engine import clear_plan, get_plan, get_teaching_context
 from core.token_utils import estimate_messages_tokens
 from core.tool_definitions import TEACHING_TOOLS
@@ -43,17 +42,17 @@ from prompts.template import build_system_prompt, load_soul
 
 router = APIRouter()
 load_dotenv()
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-)
 _teacher_soul = load_soul("teacher_socratic.md")
 _FALLBACK_REPLY = "⚠️ AI暂时无法回应，请稍后再试。"
 _TOOL_LOOP_LIMIT = 5
 
 
 def _resolve_model(req_model: str | None) -> str:
-    return req_model or os.getenv("MODEL_NAME", "gpt-4o-mini")
+    try:
+        return resolve_model(req_model)
+    except ValueError as exc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 async def _build_messages(conversation_id: str) -> list[dict]:
@@ -95,13 +94,18 @@ def _is_tool_unsupported_error(exc: Exception) -> bool:
     return any(marker in text for marker in markers)
 
 
-def _create_completion(model: str, messages: list[dict], use_tools: bool = True):
+def _create_completion(model: str, messages: list[dict], use_tools: bool = True, thinking: bool = False):
+    client = get_sync_client_for_model(model)
     kwargs = {
         "model": model,
         "messages": messages,
     }
     if use_tools:
         kwargs["tools"] = TEACHING_TOOLS
+    if thinking:
+        extra = get_thinking_extra_params(model)
+        if extra:
+            kwargs["extra_body"] = extra
 
     try:
         response = client.chat.completions.create(**kwargs)
@@ -114,7 +118,8 @@ def _create_completion(model: str, messages: list[dict], use_tools: bool = True)
         raise
 
 
-def _create_stream_completion(model: str, messages: list[dict], use_tools: bool = True):
+def _create_stream_completion(model: str, messages: list[dict], use_tools: bool = True, thinking: bool = False):
+    client = get_sync_client_for_model(model)
     kwargs = {
         "model": model,
         "messages": messages,
@@ -122,6 +127,10 @@ def _create_stream_completion(model: str, messages: list[dict], use_tools: bool 
     }
     if use_tools:
         kwargs["tools"] = TEACHING_TOOLS
+    if thinking:
+        extra = get_thinking_extra_params(model)
+        if extra:
+            kwargs["extra_body"] = extra
 
     try:
         stream = client.chat.completions.create(**kwargs)
@@ -221,6 +230,7 @@ async def _run_tool_loop(
     conversation_id: str,
     max_rounds: int = _TOOL_LOOP_LIMIT,
     disconnect_check=None,
+    thinking: bool = False,
 ) -> tuple[list[dict], str | None, dict, list[dict], bool, list[str], bool, dict | None]:
     """
     Resolve tool calls in non-streaming rounds, then return final text candidate.
@@ -242,7 +252,7 @@ async def _run_tool_loop(
         if disconnect_check and await disconnect_check():
             break
         response, tools_enabled = await asyncio.to_thread(
-            _create_completion, model, messages, use_tools=tools_enabled
+            _create_completion, model, messages, use_tools=tools_enabled, thinking=thinking
         )
         if disconnect_check and await disconnect_check():
             break
@@ -286,7 +296,7 @@ async def _run_tool_loop(
 
                 if handled.get("requires_input"):
                     if not interactive_seen:
-                        set_pending_tool(
+                        await set_pending_tool(
                             conversation_id=conversation_id,
                             tool_call_id=tool_call.id,
                             tool_name=fn_name,
@@ -482,6 +492,23 @@ def _build_tool_student_text(tool_trace: list[dict]) -> str:
     return "\n\n".join(uniq).strip()
 
 
+def _format_answers_readable(tool_name: str, answers: list[dict]) -> str:
+    """Human-readable summary of tool answers, saved to message history."""
+    lines = []
+    if tool_name == "assess":
+        lines.append("[诊断问题回答]")
+    elif tool_name == "quiz":
+        lines.append("[阶段检测回答]")
+    else:
+        lines.append("[工具问答回答]")
+    for i, item in enumerate(answers, start=1):
+        q = item.get("question", f"问题{i}") if isinstance(item, dict) else f"问题{i}"
+        a = item.get("answer", "(未回答)") if isinstance(item, dict) else "(未回答)"
+        lines.append(f"{i}. 问题：{q}")
+        lines.append(f"   回答：{a}")
+    return "\n".join(lines)
+
+
 def _format_answers(tool_name: str, answers: list[dict]) -> str:
     lines = []
     if tool_name == "assess":
@@ -575,9 +602,9 @@ async def _process_stream_tool_calls(
     stream_tool_calls: list[dict],
     assistant_content: str,
     conversation_id: str,
-) -> tuple[list[dict], dict | None]:
+) -> tuple[list[dict], dict | None, bool]:
     if not stream_tool_calls:
-        return [], None
+        return [], None, False
 
     assistant_tool_calls = []
     for idx, call in enumerate(stream_tool_calls):
@@ -603,6 +630,7 @@ async def _process_stream_tool_calls(
 
     round_tools: list[dict] = []
     pending_request: dict | None = None
+    round_force_compress = False
     interactive_seen = False
     for call in assistant_tool_calls:
         fn_name = call["function"].get("name", "")
@@ -626,7 +654,7 @@ async def _process_stream_tool_calls(
 
         if handled.get("requires_input"):
             if not interactive_seen:
-                set_pending_tool(
+                await set_pending_tool(
                     conversation_id=conversation_id,
                     tool_call_id=call["id"],
                     tool_name=fn_name,
@@ -661,6 +689,9 @@ async def _process_stream_tool_calls(
                 )
             continue
 
+        if handled.get("force_compress"):
+            round_force_compress = True
+
         result = handled.get("result") or json.dumps(
             {"status": "error", "message": "Tool returned empty result"},
             ensure_ascii=False,
@@ -681,7 +712,7 @@ async def _process_stream_tool_calls(
             }
         )
 
-    return round_tools, pending_request
+    return round_tools, pending_request, round_force_compress
 
 
 async def _prepare_retry_context(conversation_id: str):
@@ -722,13 +753,13 @@ async def chat(req: ChatRequest, response: Response) -> ChatOrToolResponse:
     try:
         # If a previous interactive tool was pending and the student sends a new message,
         # treat it as a fresh turn.
-        clear_pending_tool(conversation_id)
+        await clear_pending_tool(conversation_id)
         await add_message("user", _build_user_content(req.message, req.images), conversation_id)
         messages = await _build_messages(conversation_id)
         record_debug_request(conversation_id, model, messages, turn_index=await get_current_user_turn(conversation_id))
 
         _, reply, raw, tool_trace, _, probe_reasoning, force_compress, pending = await _run_tool_loop(
-            messages, model, conversation_id
+            messages, model, conversation_id, thinking=req.thinking
         )
         if pending:
             partial_reply = _merge_probe_thinking(reply or "", probe_reasoning)
@@ -754,9 +785,10 @@ async def chat(req: ChatRequest, response: Response) -> ChatOrToolResponse:
 async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
     conversation_id = await ensure_session(req.conversation_id)
     model = _resolve_model(req.model)
+    thinking = req.thinking
     # If a previous interactive tool was pending and the student sends a new message,
     # treat it as a fresh turn.
-    clear_pending_tool(conversation_id)
+    await clear_pending_tool(conversation_id)
     await add_message("user", _build_user_content(req.message, req.images), conversation_id)
     base_messages = await _build_messages(conversation_id)
     record_debug_request(conversation_id, model, base_messages, turn_index=await get_current_user_turn(conversation_id))
@@ -770,67 +802,17 @@ async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
         saved = False
         paused = False
         try:
-            (
-                resolved_messages,
-                partial_reply,
-                pre_raw,
-                tool_trace,
-                tools_enabled,
-                probe_reasoning,
-                force_compress,
-                pending,
-            ) = await _run_tool_loop(list(base_messages), model, conversation_id, disconnect_check=request.is_disconnected)
-            if pre_raw and not await request.is_disconnected():
-                yield _sse_payload({"type": "raw", "kind": "initial", "data": pre_raw})
-            tool_student_text = _build_tool_student_text(tool_trace)
-            for item in probe_reasoning:
-                if await request.is_disconnected():
-                    return
-                yield _sse_payload({"type": "thinking", "content": item})
-            for round_item in tool_trace:
-                for tool in round_item.get("tool_calls", []):
-                    if await request.is_disconnected():
-                        return
-                    yield _sse_payload(
-                        {
-                            "type": "tool",
-                            "name": tool.get("name", "unknown"),
-                            "arguments": tool.get("arguments"),
-                            "result": tool.get("result"),
-                        }
-                    )
-            if pending:
-                if partial_reply:
-                    yield _sse_payload({"type": "token", "content": partial_reply})
-                yield _sse_payload(
-                    {
-                        "type": "tool_input_required",
-                        **pending,
-                    }
-                )
-                yield _sse_payload(
-                    {
-                        "type": "done",
-                        "full_content": partial_reply or "",
-                        "thinking_content": "",
-                        "conversation_id": conversation_id,
-                        "paused": True,
-                    }
-                )
-                paused = True
-                return
-            if tool_student_text:
-                full_reply += f"{tool_student_text}\n\n"
-                if await request.is_disconnected():
-                    return
-                yield _sse_payload({"type": "token", "content": f"{tool_student_text}\n\n"})
+            tool_trace: list[dict] = []
+            messages = list(base_messages)
+            tools_enabled = True
 
             stream_completed = False
             for _ in range(_TOOL_LOOP_LIMIT):
                 stream, tools_enabled = _create_stream_completion(
                     model=model,
-                    messages=resolved_messages,
+                    messages=messages,
                     use_tools=tools_enabled,
+                    thinking=thinking,
                 )
                 round_content = ""
                 round_tool_parts: list[dict] = []
@@ -870,12 +852,13 @@ async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
                     stream_completed = True
                     break
 
-                round_tools, stream_pending = await _process_stream_tool_calls(
-                    resolved_messages,
+                round_tools, stream_pending, round_fc = await _process_stream_tool_calls(
+                    messages,
                     merged_tool_calls,
                     round_content,
                     conversation_id,
                 )
+                force_compress = force_compress or round_fc
                 if round_tools:
                     tool_trace.append(
                         {
@@ -1014,6 +997,20 @@ async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
     )
 
 
+@router.get("/chat/history")
+async def chat_history(conversation_id: str | None = Query(default=None)):
+    resolved_session = await ensure_session(conversation_id)
+    messages = await get_recent_messages(resolved_session)
+    pending = await get_pending_tool(resolved_session)
+    result: dict = {
+        "conversation_id": resolved_session,
+        "messages": messages,
+    }
+    if pending and pending.get("input_request"):
+        result["tool_input_required"] = pending["input_request"]
+    return result
+
+
 @router.get("/chat/debug-info")
 async def debug_info(conversation_id: str | None = Query(default=None)) -> dict:
     resolved_session = await ensure_session(conversation_id)
@@ -1032,7 +1029,7 @@ async def debug_info(conversation_id: str | None = Query(default=None)) -> dict:
         "teaching_plan": await _build_plan_payload(resolved_session),
         "history_length": len(history),
         "token_estimate": estimate_messages_tokens(history),
-        "model": os.getenv("MODEL_NAME", "gpt-4o-mini"),
+        "model": resolve_model(None),
         "conversation_id": resolved_session,
         "debug_turns": get_debug_turns(resolved_session),
     }
@@ -1043,7 +1040,7 @@ async def clear_chat(conversation_id: str | None = Query(default=None)) -> dict:
     resolved_session = await ensure_session(conversation_id)
     await clear_history(resolved_session)
     await clear_plan(resolved_session)
-    clear_pending_tool(resolved_session)
+    await clear_pending_tool(resolved_session)
     return {"status": "ok", "conversation_id": resolved_session}
 
 
@@ -1051,7 +1048,7 @@ async def clear_chat(conversation_id: str | None = Query(default=None)) -> dict:
 async def tool_response(req: ToolResponseRequest, response: Response) -> ChatOrToolResponse:
     conversation_id = await ensure_session(req.conversation_id)
     response.headers["X-Conversation-Id"] = conversation_id
-    pending = get_pending_tool(conversation_id)
+    pending = await get_pending_tool(conversation_id)
     if not pending:
         return ChatOrToolResponse(reply="⚠️ 当前没有待回答的工具问题。")
     if pending.get("tool_call_id") != req.tool_call_id:
@@ -1066,7 +1063,9 @@ async def tool_response(req: ToolResponseRequest, response: Response) -> ChatOrT
             "content": _format_answers(str(pending.get("tool_name", "")), req.answers),
         }
     )
-    clear_pending_tool(conversation_id)
+    tool_name = str(pending.get("tool_name", ""))
+    answers_text = _format_answers_readable(tool_name, req.answers)
+    await clear_pending_tool(conversation_id)
     record_debug_request(conversation_id, model, messages, turn_index=await get_current_user_turn(conversation_id))
 
     try:
@@ -1079,7 +1078,7 @@ async def tool_response(req: ToolResponseRequest, response: Response) -> ChatOrT
             probe_reasoning,
             force_compress,
             new_pending,
-        ) = await _run_tool_loop(messages, model, conversation_id)
+        ) = await _run_tool_loop(messages, model, conversation_id, thinking=req.thinking)
         if new_pending:
             partial_reply = _merge_probe_thinking(reply or "", probe_reasoning)
             return ChatOrToolResponse(reply=partial_reply, tool_input_required=new_pending)
@@ -1088,6 +1087,7 @@ async def tool_response(req: ToolResponseRequest, response: Response) -> ChatOrT
         if tool_student_text and tool_student_text not in (reply or ""):
             reply = f"{tool_student_text}\n\n{reply or ''}".strip()
         reply = _merge_probe_thinking(reply or "", probe_reasoning)
+        await add_message("user", answers_text, conversation_id)
         await _save_assistant_and_debug(
             conversation_id,
             reply,
@@ -1107,7 +1107,7 @@ async def tool_response(req: ToolResponseRequest, response: Response) -> ChatOrT
 @router.post("/chat/tool-response/stream")
 async def tool_response_stream(req: ToolResponseRequest, request: Request) -> StreamingResponse:
     conversation_id = await ensure_session(req.conversation_id)
-    pending = get_pending_tool(conversation_id)
+    pending = await get_pending_tool(conversation_id)
     if not pending:
         async def no_pending() -> AsyncGenerator[str, None]:
             yield _sse_payload({"type": "error", "message": "No pending tool call", "conversation_id": conversation_id})
@@ -1126,15 +1126,18 @@ async def tool_response_stream(req: ToolResponseRequest, request: Request) -> St
         )
 
     model = _resolve_model(req.model)
+    thinking = req.thinking
+    tool_name = str(pending.get("tool_name", ""))
+    answers_text = _format_answers_readable(tool_name, req.answers)
     base_messages = list(pending.get("messages", []))
     base_messages.append(
         {
             "role": "tool",
             "tool_call_id": req.tool_call_id,
-            "content": _format_answers(str(pending.get("tool_name", "")), req.answers),
+            "content": _format_answers(tool_name, req.answers),
         }
     )
-    clear_pending_tool(conversation_id)
+    await clear_pending_tool(conversation_id)
     record_debug_request(conversation_id, model, base_messages, turn_index=await get_current_user_turn(conversation_id))
 
     async def event_generator() -> AsyncGenerator[str, None]:
@@ -1146,42 +1149,13 @@ async def tool_response_stream(req: ToolResponseRequest, request: Request) -> St
         saved = False
         paused = False
         try:
-            (
-                resolved_messages,
-                partial_reply,
-                _,
-                tool_trace,
-                tools_enabled,
-                probe_reasoning,
-                force_compress,
-                next_pending,
-            ) = await _run_tool_loop(list(base_messages), model, conversation_id, disconnect_check=request.is_disconnected)
-            for item in probe_reasoning:
-                if await request.is_disconnected():
-                    return
-                full_thinking += item
-                yield _sse_payload({"type": "thinking", "content": item})
-
-            if next_pending:
-                if partial_reply:
-                    full_reply += partial_reply
-                    yield _sse_payload({"type": "token", "content": partial_reply})
-                yield _sse_payload({"type": "tool_input_required", **next_pending})
-                yield _sse_payload(
-                    {"type": "done", "full_content": full_reply, "thinking_content": full_thinking, "conversation_id": conversation_id, "paused": True}
-                )
-                paused = True
-                return
-
-            tool_student_text = _build_tool_student_text(tool_trace)
-            if tool_student_text:
-                text_payload = f"{tool_student_text}\n\n"
-                full_reply += text_payload
-                yield _sse_payload({"type": "token", "content": text_payload})
+            tool_trace: list[dict] = []
+            messages = list(base_messages)
+            tools_enabled = True
 
             stream_completed = False
             for _ in range(_TOOL_LOOP_LIMIT):
-                stream, tools_enabled = _create_stream_completion(model, resolved_messages, use_tools=tools_enabled)
+                stream, tools_enabled = _create_stream_completion(model, messages, use_tools=tools_enabled, thinking=thinking)
                 round_content = ""
                 round_tool_parts: list[dict] = []
                 for chunk in stream:
@@ -1208,9 +1182,10 @@ async def tool_response_stream(req: ToolResponseRequest, request: Request) -> St
                 if not merged_tool_calls:
                     stream_completed = True
                     break
-                round_tools, stream_pending = await _process_stream_tool_calls(
-                    resolved_messages, merged_tool_calls, round_content, conversation_id
+                round_tools, stream_pending, round_fc = await _process_stream_tool_calls(
+                    messages, merged_tool_calls, round_content, conversation_id
                 )
+                force_compress = force_compress or round_fc
                 if round_tools:
                     tool_trace.append({"round": len(tool_trace) + 1, "tool_calls": round_tools})
                     for tool in round_tools:
@@ -1232,6 +1207,7 @@ async def tool_response_stream(req: ToolResponseRequest, request: Request) -> St
                 yield _sse_payload({"type": "token", "content": timeout_note})
 
             saved = True
+            await add_message("user", answers_text, conversation_id)
             await _save_assistant_and_debug(
                 conversation_id,
                 full_reply,
@@ -1285,14 +1261,14 @@ async def retry(req: RetryRequest, response: Response) -> ChatOrToolResponse:
     conversation_id = await ensure_session(req.conversation_id)
     response.headers["X-Conversation-Id"] = conversation_id
     model = _resolve_model(req.model)
-    clear_pending_tool(conversation_id)
+    await clear_pending_tool(conversation_id)
 
     try:
         messages = await _prepare_retry_context(conversation_id)
         record_debug_request(conversation_id, model, messages, turn_index=await get_current_user_turn(conversation_id))
 
         _, reply, raw, tool_trace, _, probe_reasoning, force_compress, pending = await _run_tool_loop(
-            messages, model, conversation_id
+            messages, model, conversation_id, thinking=req.thinking
         )
         if pending:
             partial_reply = _merge_probe_thinking(reply or "", probe_reasoning)
@@ -1318,7 +1294,8 @@ async def retry(req: RetryRequest, response: Response) -> ChatOrToolResponse:
 async def retry_stream(req: RetryRequest, request: Request) -> StreamingResponse:
     conversation_id = await ensure_session(req.conversation_id)
     model = _resolve_model(req.model)
-    clear_pending_tool(conversation_id)
+    thinking = req.thinking
+    await clear_pending_tool(conversation_id)
 
     try:
         base_messages = await _prepare_retry_context(conversation_id)
@@ -1349,60 +1326,17 @@ async def retry_stream(req: RetryRequest, request: Request) -> StreamingResponse
         saved = False
         paused = False
         try:
-            (
-                resolved_messages,
-                partial_reply,
-                _,
-                tool_trace,
-                tools_enabled,
-                probe_reasoning,
-                force_compress,
-                pending,
-            ) = await _run_tool_loop(list(base_messages), model, conversation_id, disconnect_check=request.is_disconnected)
-            tool_student_text = _build_tool_student_text(tool_trace)
-            for item in probe_reasoning:
-                if await request.is_disconnected():
-                    return
-                yield _sse_payload({"type": "thinking", "content": item})
-            for round_item in tool_trace:
-                for tool in round_item.get("tool_calls", []):
-                    if await request.is_disconnected():
-                        return
-                    yield _sse_payload(
-                        {
-                            "type": "tool",
-                            "name": tool.get("name", "unknown"),
-                            "arguments": tool.get("arguments"),
-                            "result": tool.get("result"),
-                        }
-                    )
-            if pending:
-                if partial_reply:
-                    yield _sse_payload({"type": "token", "content": partial_reply})
-                yield _sse_payload({"type": "tool_input_required", **pending})
-                yield _sse_payload(
-                    {
-                        "type": "done",
-                        "full_content": partial_reply or "",
-                        "thinking_content": "",
-                        "conversation_id": conversation_id,
-                        "paused": True,
-                    }
-                )
-                paused = True
-                return
-            if tool_student_text:
-                full_reply += f"{tool_student_text}\n\n"
-                if await request.is_disconnected():
-                    return
-                yield _sse_payload({"type": "token", "content": f"{tool_student_text}\n\n"})
+            tool_trace: list[dict] = []
+            messages = list(base_messages)
+            tools_enabled = True
 
             stream_completed = False
             for _ in range(_TOOL_LOOP_LIMIT):
                 stream, tools_enabled = _create_stream_completion(
                     model=model,
-                    messages=resolved_messages,
+                    messages=messages,
                     use_tools=tools_enabled,
+                    thinking=thinking,
                 )
                 round_content = ""
                 round_tool_parts: list[dict] = []
@@ -1439,12 +1373,13 @@ async def retry_stream(req: RetryRequest, request: Request) -> StreamingResponse
                     stream_completed = True
                     break
 
-                round_tools, stream_pending = await _process_stream_tool_calls(
-                    resolved_messages,
+                round_tools, stream_pending, round_fc = await _process_stream_tool_calls(
+                    messages,
                     merged_tool_calls,
                     round_content,
                     conversation_id,
                 )
+                force_compress = force_compress or round_fc
                 if round_tools:
                     tool_trace.append(
                         {
@@ -1567,14 +1502,14 @@ async def rewind(req: RewindRequest, response: Response) -> ChatOrToolResponse:
     conversation_id = await ensure_session(req.conversation_id)
     response.headers["X-Conversation-Id"] = conversation_id
     model = _resolve_model(req.model)
-    clear_pending_tool(conversation_id)
+    await clear_pending_tool(conversation_id)
 
     try:
         messages = await _prepare_rewind_context(conversation_id, req)
         record_debug_request(conversation_id, model, messages, turn_index=req.target_user_turn)
 
         _, reply, raw, tool_trace, _, probe_reasoning, force_compress, pending = await _run_tool_loop(
-            messages, model, conversation_id
+            messages, model, conversation_id, thinking=req.thinking
         )
         if pending:
             partial_reply = _merge_probe_thinking(reply or "", probe_reasoning)
@@ -1600,7 +1535,8 @@ async def rewind(req: RewindRequest, response: Response) -> ChatOrToolResponse:
 async def rewind_stream(req: RewindRequest, request: Request) -> StreamingResponse:
     conversation_id = await ensure_session(req.conversation_id)
     model = _resolve_model(req.model)
-    clear_pending_tool(conversation_id)
+    thinking = req.thinking
+    await clear_pending_tool(conversation_id)
 
     try:
         base_messages = await _prepare_rewind_context(conversation_id, req)
@@ -1631,60 +1567,17 @@ async def rewind_stream(req: RewindRequest, request: Request) -> StreamingRespon
         saved = False
         paused = False
         try:
-            (
-                resolved_messages,
-                partial_reply,
-                _,
-                tool_trace,
-                tools_enabled,
-                probe_reasoning,
-                force_compress,
-                pending,
-            ) = await _run_tool_loop(list(base_messages), model, conversation_id, disconnect_check=request.is_disconnected)
-            tool_student_text = _build_tool_student_text(tool_trace)
-            for item in probe_reasoning:
-                if await request.is_disconnected():
-                    return
-                yield _sse_payload({"type": "thinking", "content": item})
-            for round_item in tool_trace:
-                for tool in round_item.get("tool_calls", []):
-                    if await request.is_disconnected():
-                        return
-                    yield _sse_payload(
-                        {
-                            "type": "tool",
-                            "name": tool.get("name", "unknown"),
-                            "arguments": tool.get("arguments"),
-                            "result": tool.get("result"),
-                        }
-                    )
-            if pending:
-                if partial_reply:
-                    yield _sse_payload({"type": "token", "content": partial_reply})
-                yield _sse_payload({"type": "tool_input_required", **pending})
-                yield _sse_payload(
-                    {
-                        "type": "done",
-                        "full_content": partial_reply or "",
-                        "thinking_content": "",
-                        "conversation_id": conversation_id,
-                        "paused": True,
-                    }
-                )
-                paused = True
-                return
-            if tool_student_text:
-                full_reply += f"{tool_student_text}\n\n"
-                if await request.is_disconnected():
-                    return
-                yield _sse_payload({"type": "token", "content": f"{tool_student_text}\n\n"})
+            tool_trace: list[dict] = []
+            messages = list(base_messages)
+            tools_enabled = True
 
             stream_completed = False
             for _ in range(_TOOL_LOOP_LIMIT):
                 stream, tools_enabled = _create_stream_completion(
                     model=model,
-                    messages=resolved_messages,
+                    messages=messages,
                     use_tools=tools_enabled,
+                    thinking=thinking,
                 )
                 round_content = ""
                 round_tool_parts: list[dict] = []
@@ -1721,12 +1614,13 @@ async def rewind_stream(req: RewindRequest, request: Request) -> StreamingRespon
                     stream_completed = True
                     break
 
-                round_tools, stream_pending = await _process_stream_tool_calls(
-                    resolved_messages,
+                round_tools, stream_pending, round_fc = await _process_stream_tool_calls(
+                    messages,
                     merged_tool_calls,
                     round_content,
                     conversation_id,
                 )
+                force_compress = force_compress or round_fc
                 if round_tools:
                     tool_trace.append(
                         {
