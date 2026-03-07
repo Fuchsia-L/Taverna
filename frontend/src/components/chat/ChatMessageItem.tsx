@@ -1,11 +1,12 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { Bot, ChevronDown, Lightbulb, Pencil, RefreshCw, User } from "lucide-react";
+import { Bot, Check, ChevronDown, Copy, Lightbulb, Pencil, RefreshCw, User } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import { AssessCard } from "@/components/cards/AssessCard";
+import { PlanConfirmCard } from "@/components/cards/PlanConfirmCard";
 import { cn } from "@/lib/utils";
-import { ChatMessage } from "@/types/chat";
+import { ChatMessage, PlanCardNode } from "@/types/chat";
 import { parseThinking } from "@/utils/parseThinking";
 import { preprocessLaTeX } from "@/utils/mathPreprocess";
 
@@ -18,10 +19,17 @@ interface ChatMessageItemProps {
   onPrevVersion: () => void;
   onNextVersion: () => void;
   onToolSubmit: (toolCallId: string, answers: Array<{ question: string; answer: string }>) => void;
+  onPlanConfirm: (projectId: string, nodes: PlanCardNode[]) => void;
 }
 
 function MessageContent({ content, className }: { content: string; className?: string }) {
-  const normalized = useMemo(() => preprocessLaTeX(content), [content]);
+  const normalized = useMemo(() => {
+    // Fix bold/italic markers adjacent to CJK punctuation (CommonMark flanking rules)
+    let text = preprocessLaTeX(content);
+    text = text.replace(/(\*{1,3})(?=[^\s*\p{L}\p{N}])/gu, "$1\u200B");
+    text = text.replace(/(?<=[^\s*\p{L}\p{N}])(\*{1,3})/gu, "\u200B$1");
+    return text;
+  }, [content]);
 
   return (
     <ReactMarkdown
@@ -63,13 +71,14 @@ export function ChatMessageItem({
   onEditSave,
   onPrevVersion,
   onNextVersion,
-  onToolSubmit
+  onToolSubmit,
+  onPlanConfirm
 }: ChatMessageItemProps) {
   const [showThinking, setShowThinking] = useState(false);
-  const [thinkingAutoCollapsed, setThinkingAutoCollapsed] = useState(false);
   const [showRaw, setShowRaw] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(message.content);
+  const [wasStreaming, setWasStreaming] = useState(Boolean(message.isStreaming));
   const isTeacher = message.role === "teacher";
   const parsed = useMemo(() => parseThinking(message.content), [message.content]);
   const showParsedTeacher = isTeacher && !message.isStreaming;
@@ -86,6 +95,7 @@ export function ChatMessageItem({
   const canEdit = message.role === "student";
   const versionTotal = message.versions?.length ?? 1;
   const versionIndex = (message.currentVersion ?? 0) + 1;
+  const [copied, setCopied] = useState(false);
 
   useEffect(() => {
     if (!editing) {
@@ -94,7 +104,6 @@ export function ChatMessageItem({
   }, [editing, message.content]);
 
   useEffect(() => {
-    setThinkingAutoCollapsed(false);
     setShowThinking(Boolean(message.isStreaming));
   }, [message.id]);
 
@@ -103,25 +112,15 @@ export function ChatMessageItem({
       return;
     }
     setShowThinking(true);
-    setThinkingAutoCollapsed(false);
   }, [isTeacher, message.isStreaming]);
 
   useEffect(() => {
-    if (!isTeacher || !message.isStreaming || !showStreamingThinking) {
-      return;
+    const nowStreaming = Boolean(message.isStreaming);
+    if (wasStreaming && !nowStreaming && isTeacher && Boolean(thinkingText)) {
+      setShowThinking(false);
     }
-    if (!visibleContent.trim() || thinkingAutoCollapsed) {
-      return;
-    }
-    setShowThinking(false);
-    setThinkingAutoCollapsed(true);
-  }, [
-    isTeacher,
-    message.isStreaming,
-    showStreamingThinking,
-    visibleContent,
-    thinkingAutoCollapsed
-  ]);
+    setWasStreaming(nowStreaming);
+  }, [isTeacher, message.isStreaming, thinkingText, wasStreaming]);
 
   const handleSave = (event: FormEvent) => {
     event.preventDefault();
@@ -183,6 +182,21 @@ export function ChatMessageItem({
                 title="编辑消息"
               >
                 <Pencil size={13} />
+              </button>
+            )}
+            {!editing && !message.isStreaming && (
+              <button
+                type="button"
+                onClick={() => {
+                  navigator.clipboard.writeText(visibleContent).then(() => {
+                    setCopied(true);
+                    setTimeout(() => setCopied(false), 1500);
+                  });
+                }}
+                className="rounded p-1 text-app-muted/70 opacity-0 transition-opacity hover:text-app-info group-hover:opacity-100"
+                title="复制内容"
+              >
+                {copied ? <Check size={13} className="text-green-400" /> : <Copy size={13} />}
               </button>
             )}
             {isTeacher && (
@@ -300,6 +314,14 @@ export function ChatMessageItem({
                     onSubmit={onToolSubmit}
                     submitted={message.toolCardSubmitted}
                     initialAnswers={message.toolAnswers}
+                  />
+                )}
+                {isTeacher && message.planCard && (
+                  <PlanConfirmCard
+                    nodes={message.planCard.nodes}
+                    projectId={message.planCard.projectId}
+                    onConfirm={onPlanConfirm}
+                    confirmed={message.planCardConfirmed}
                   />
                 )}
                 {devMode && (

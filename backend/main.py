@@ -11,6 +11,7 @@ load_dotenv()
 
 from api.chat import router as chat_router
 from api.project import router as project_router
+from api.provider import router as provider_router
 from db.models import User
 from db.session import SessionLocal
 
@@ -26,13 +27,14 @@ app.add_middleware(
 
 app.include_router(chat_router, prefix="/api", tags=["chat"])
 app.include_router(project_router, prefix="/api", tags=["project"])
+app.include_router(provider_router, prefix="/api", tags=["provider"])
 
 
 @app.on_event("startup")
 async def ensure_default_user():
     try:
         async with SessionLocal() as db:
-            user = await db.scalar(select(User).where(User.name == "default"))
+            user = await db.scalar(select(User).where(User.name == "default").order_by(User.created_at.asc(), User.id.asc()))
             if not user:
                 db.add(User(name="default"))
                 await db.commit()

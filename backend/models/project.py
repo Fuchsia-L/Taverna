@@ -2,7 +2,7 @@ from pydantic import BaseModel, Field
 
 
 class CreateProjectRequest(BaseModel):
-    title: str
+    title: str | None = None
     description: str | None = None
 
 

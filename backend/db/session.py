@@ -12,7 +12,9 @@ def _resolve_database_url() -> str:
 
 
 DATABASE_URL = _resolve_database_url()
-engine = create_async_engine(DATABASE_URL, future=True, echo=False, pool_pre_ping=True)
+engine = create_async_engine(
+    DATABASE_URL, future=True, echo=False, pool_pre_ping=True, pool_recycle=300
+)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 

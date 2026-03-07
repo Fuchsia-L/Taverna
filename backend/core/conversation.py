@@ -310,6 +310,69 @@ async def rewind_to_user_turn(conversation_id: str, target_user_turn: int) -> bo
     return True
 
 
+async def preview_rewind_to_user_turn(
+    conversation_id: str,
+    target_user_turn: int,
+    replacement_content: str | list,
+) -> tuple[str, list[dict], callable]:
+    """Build the post-rewind history in memory and return a commit callback."""
+    if target_user_turn < 1:
+        raise ValueError("Invalid target_user_turn for rewind.")
+
+    resolved = await _ensure_conversation_exists(conversation_id)
+    conv_uuid = UUID(resolved)
+
+    async with SessionLocal() as db:
+        user_rows = await db.scalars(
+            select(Message)
+            .where(Message.conversation_id == conv_uuid, Message.role == MessageRole.user)
+            .order_by(Message.created_at.asc(), Message.id.asc())
+        )
+        users = list(user_rows)
+        if len(users) < target_user_turn:
+            raise ValueError("Invalid target_user_turn for rewind.")
+
+        boundary = users[target_user_turn - 1]
+        all_rows = await db.scalars(
+            select(Message)
+            .where(Message.conversation_id == conv_uuid)
+            .order_by(Message.created_at.asc(), Message.id.asc())
+        )
+        rows = list(all_rows)
+        boundary_index = next((idx for idx, row in enumerate(rows) if row.id == boundary.id), None)
+        if boundary_index is None:
+            raise ValueError("Invalid target_user_turn for rewind.")
+
+        conversation = await db.scalar(select(Conversation).where(Conversation.id == conv_uuid))
+        summary = conversation.summary if conversation and conversation.summary else ""
+        compressed_idx = None
+        if conversation and conversation.compressed_before_id is not None:
+            compressed_idx = next(
+                (idx for idx, row in enumerate(rows) if row.id == conversation.compressed_before_id),
+                None,
+            )
+
+    trimmed_history = [{"role": row.role.value, "content": row.content} for row in rows[:boundary_index]]
+    trimmed_history.append({"role": "user", "content": replacement_content})
+
+    if compressed_idx is None:
+        preview_messages = trimmed_history
+    elif boundary_index <= compressed_idx:
+        summary = ""
+        preview_messages = trimmed_history
+    else:
+        preview_messages = trimmed_history[compressed_idx + 1 :]
+
+    async def commit() -> None:
+        if not await rewind_to_user_turn(resolved, target_user_turn):
+            raise ValueError("Invalid target_user_turn for rewind.")
+        if not await remove_last_user(resolved):
+            raise ValueError("Failed to replace rewound user message.")
+        await add_message("user", replacement_content, resolved)
+
+    return summary, preview_messages, commit
+
+
 def record_debug_request(
     conversation_id: str,
     model: str,

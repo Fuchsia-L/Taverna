@@ -16,6 +16,7 @@ class ChatRequest(BaseModel):
     images: list[str] = Field(default_factory=list, max_length=_MAX_IMAGES)
     model: str | None = None
     conversation_id: str | None = None
+    thinking: bool = False
 
     @field_validator("images")
     @classmethod
@@ -26,6 +27,7 @@ class ChatRequest(BaseModel):
 class RetryRequest(BaseModel):
     conversation_id: str
     model: str | None = None
+    thinking: bool = False
 
 
 class RewindRequest(BaseModel):
@@ -34,6 +36,7 @@ class RewindRequest(BaseModel):
     replacement_message: str
     images: list[str] = Field(default_factory=list, max_length=_MAX_IMAGES)
     model: str | None = None
+    thinking: bool = False
 
     @field_validator("images")
     @classmethod
@@ -48,6 +51,7 @@ class ChatResponse(BaseModel):
 class ChatOrToolResponse(BaseModel):
     reply: str
     tool_input_required: dict | None = None
+    plan_card: dict | None = None
 
 
 class ToolResponseRequest(BaseModel):
@@ -55,3 +59,4 @@ class ToolResponseRequest(BaseModel):
     tool_call_id: str
     answers: list[dict]
     model: str | None = None
+    thinking: bool = False

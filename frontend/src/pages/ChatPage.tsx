@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { ConversationManager } from "@/components/ConversationManager";
 import { DebugPanel } from "@/components/DebugPanel";
 import { SettingsPanel } from "@/components/SettingsPanel";
 import { TeachingPlanCard } from "@/components/TeachingPlanCard";
@@ -10,10 +11,9 @@ import {
   createProject,
   createStandaloneConversation,
   DebugInfo,
+  fetchConversationHistory,
   fetchDebugInfo,
-  getProjectConversations,
-  listProjects,
-  listStandaloneConversations,
+  fetchNavigation,
   ProjectSummary,
   retryLastReply,
   retryLastReplyStream,
@@ -23,11 +23,14 @@ import {
   submitToolResponse,
   submitToolResponseStream,
   sendMessageWithOptions,
-  sendMessageStream
+  sendMessageStream,
+  confirmProjectPlan,
+  deleteConversation,
+  deleteProject
 } from "@/services/chatApi";
 import { useSettings } from "@/stores/settingsStore";
 import { APP_CONFIG } from "@/config/app";
-import { AttachedImage, ChatMessage, ToolInputEvent } from "@/types/chat";
+import { AttachedImage, ChatMessage, PlanCardNode, ToolInputEvent } from "@/types/chat";
 
 let messageIdCounter = 0;
 
@@ -52,6 +55,8 @@ type LiveRawState = {
   final?: unknown;
 };
 
+const PLAN_NOTICE_FINGERPRINT_KEY = "taverna_plan_notice_fingerprint_v1";
+
 function applyLiveRawEvent(prev: LiveRawState | null, event: StreamRawPayload): LiveRawState {
   const next: LiveRawState = prev || { chunks: [], toolRounds: [] };
   const kind = event.kind || "misc";
@@ -70,6 +75,164 @@ function applyLiveRawEvent(prev: LiveRawState | null, event: StreamRawPayload): 
   return {
     ...next,
     chunks: [...next.chunks, { kind, data: event.data }],
+  };
+}
+
+function buildPlanFingerprint(conversationId: string | null, plan: DebugInfo["teaching_plan"] | null): string | null {
+  if (!conversationId || !plan) {
+    return null;
+  }
+  const phaseCount = Array.isArray(plan.phases) ? plan.phases.length : 0;
+  return `${conversationId}::${phaseCount}::${plan.current_phase ?? "none"}`;
+}
+
+function parseMimeFromDataUrl(dataUrl: string): string {
+  const match = /^data:([^;]+);base64,/i.exec(dataUrl);
+  return match?.[1] || "image/*";
+}
+
+function extractTextAndImages(content: unknown): { text: string; images?: AttachedImage[] } {
+  if (typeof content === "string") {
+    return { text: content };
+  }
+  if (!Array.isArray(content)) {
+    return { text: String(content ?? "") };
+  }
+
+  const texts: string[] = [];
+  const images: AttachedImage[] = [];
+  let imageIndex = 1;
+  for (const part of content) {
+    if (!part || typeof part !== "object") {
+      continue;
+    }
+    const item = part as Record<string, unknown>;
+    const type = String(item.type || "");
+    if (type === "text" || type === "input_text") {
+      const text = typeof item.text === "string" ? item.text : "";
+      if (text) {
+        texts.push(text);
+      }
+      continue;
+    }
+    if (type === "image_url") {
+      const image = item.image_url as { url?: string } | undefined;
+      const dataUrl = typeof image?.url === "string" ? image.url : "";
+      if (!dataUrl) {
+        continue;
+      }
+      images.push({
+        dataUrl,
+        mimeType: parseMimeFromDataUrl(dataUrl),
+        name: `image-${imageIndex}`,
+        sizeBytes: dataUrl.length,
+      });
+      imageIndex += 1;
+    }
+  }
+  return {
+    text: texts.join("\n").trim(),
+    images: images.length > 0 ? images : undefined,
+  };
+}
+
+function buildMessagesFromHistory(
+  history: Array<{ role: "user" | "assistant" | "system"; content: unknown }>
+): ChatMessage[] {
+  const items: ChatMessage[] = [];
+  let turn = 0;
+
+  for (const msg of history) {
+    if (msg.role === "system") {
+      continue;
+    }
+    if (msg.role === "user") {
+      turn += 1;
+      const parsed = extractTextAndImages(msg.content);
+      items.push({
+        id: buildId(),
+        role: "student",
+        content: parsed.text,
+        images: parsed.images,
+        turnIndex: turn,
+        versions: [parsed.text],
+        rawVersions: [undefined],
+        currentVersion: 0,
+      });
+      continue;
+    }
+    const text = typeof msg.content === "string" ? msg.content : String(msg.content ?? "");
+    items.push({
+      id: buildId(),
+      role: "teacher",
+      content: text,
+      turnIndex: turn > 0 ? turn : undefined,
+      versions: [text],
+      rawVersions: [undefined],
+      currentVersion: 0,
+    });
+  }
+
+  return items;
+}
+
+function normalizeToolInputEvent(event: ToolInputEvent): ToolInputEvent {
+  const parseQuestionsText = (text: string): unknown => {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return [];
+    }
+
+    let probe: unknown = trimmed;
+    for (let i = 0; i < 3; i += 1) {
+      if (typeof probe !== "string") {
+        break;
+      }
+      try {
+        probe = JSON.parse(probe.trim());
+      } catch {
+        break;
+      }
+    }
+    if (typeof probe !== "string") {
+      return probe;
+    }
+
+    const listMatch = probe.match(/\[[\s\S]*\]/);
+    if (listMatch) {
+      try {
+        return JSON.parse(listMatch[0]);
+      } catch {
+        return [];
+      }
+    }
+    return [];
+  };
+
+  const parseQuestions = (raw: unknown): Array<Record<string, unknown>> => {
+    if (Array.isArray(raw)) {
+      return raw.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object");
+    }
+    if (typeof raw === "string") {
+      return parseQuestions(parseQuestionsText(raw));
+    }
+    if (raw && typeof raw === "object") {
+      return [raw as Record<string, unknown>];
+    }
+    return [];
+  };
+
+  const rawQuestions = parseQuestions((event as { questions?: unknown }).questions);
+  return {
+    ...event,
+    questions: rawQuestions.map((q, index) => {
+      const item = q;
+      return {
+        question: String(item?.question ?? `问题${index + 1}`),
+        purpose: typeof item?.purpose === "string" ? item.purpose : undefined,
+        expected_concept: typeof item?.expected_concept === "string" ? item.expected_concept : undefined,
+      };
+    }),
   };
 }
 
@@ -308,46 +471,100 @@ export function ChatPage() {
   const [toolEvents, setToolEvents] = useState<Array<{ id: string; text: string }>>([]);
   const [teachingPlan, setTeachingPlan] = useState<DebugInfo["teaching_plan"]>(null);
   const [showPlanPanel, setShowPlanPanel] = useState(false);
+  const [showConversationManager, setShowConversationManager] = useState(false);
   const [showPlanNotice, setShowPlanNotice] = useState(false);
   const [planBuildState, setPlanBuildState] = useState<"idle" | "building" | "done">("idle");
   const [submittingToolAnswer, setSubmittingToolAnswer] = useState(false);
   const [pendingImages, setPendingImages] = useState<AttachedImage[]>([]);
+  const [bootstrapLoading, setBootstrapLoading] = useState(true);
+  const [bootstrapProgress, setBootstrapProgress] = useState(4);
+  const [bootstrapStatus, setBootstrapStatus] = useState("正在连接后端...");
+  const [bootstrapHint, setBootstrapHint] = useState<string | null>(null);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [standaloneConversations, setStandaloneConversations] = useState<ConversationMeta[]>([]);
   const [projectConversations, setProjectConversations] = useState<Record<string, ConversationMeta[]>>({});
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: buildId(),
-      role: "teacher",
-      content: APP_CONFIG.text.initialTeacherMessage
-    }
-  ]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const messageEndRef = useRef<HTMLDivElement>(null);
   const activeRequestRef = useRef<AbortController | null>(null);
   const handledToolSignalsRef = useRef<Set<string>>(new Set());
   const previousPlanExistsRef = useRef(false);
+  const planBuildStateRef = useRef<"idle" | "building" | "done">("idle");
+  const loadConversationRequestRef = useRef(0);
+  const sendingRef = useRef(false);
+  const latestConversationIdRef = useRef<string | null>(settings.conversationId);
+  const bootstrapCompletedRef = useRef(false);
+  const bootstrapRetryAttemptRef = useRef(0);
+  const commitConversationId = useCallback(
+    (conversationId: string | null) => {
+      latestConversationIdRef.current = conversationId;
+      setConversationId(conversationId);
+    },
+    [setConversationId]
+  );
+
+  const clearPlanNoticeFingerprint = useCallback(() => {
+    try {
+      sessionStorage.removeItem(PLAN_NOTICE_FINGERPRINT_KEY);
+    } catch {
+      // ignore storage errors
+    }
+  }, []);
+
+  const maybeShowPlanNotice = useCallback((conversationId: string | null, plan: DebugInfo["teaching_plan"] | null) => {
+    const fingerprint = buildPlanFingerprint(conversationId, plan);
+    if (!fingerprint) {
+      return;
+    }
+    try {
+      const shownFingerprint = sessionStorage.getItem(PLAN_NOTICE_FINGERPRINT_KEY);
+      if (shownFingerprint === fingerprint) {
+        return;
+      }
+      sessionStorage.setItem(PLAN_NOTICE_FINGERPRINT_KEY, fingerprint);
+    } catch {
+      // ignore storage errors; still show notice
+    }
+    setShowPlanNotice(true);
+  }, []);
 
   const pushToolEvent = useCallback((name: string) => {
     const id = buildId();
     setToolEvents((prev) => [...prev, { id, text: `工具调用：${name}` }]);
-    setPlanBuildState("building");
+    if (name === "plan") {
+      planBuildStateRef.current = "building";
+      setPlanBuildState("building");
+    }
     setTimeout(() => {
       setToolEvents((prev) => prev.filter((item) => item.id !== id));
     }, 4500);
   }, []);
 
   const addToolCard = useCallback((event: ToolInputEvent) => {
+    const normalized = normalizeToolInputEvent(event);
     setMessages((prev) => [
       ...prev,
       {
         id: buildId(),
         role: "teacher",
         content: "",
-        toolCard: event,
+        toolCard: normalized,
         toolCardSubmitted: false,
         versions: [""],
         rawVersions: [undefined],
         currentVersion: 0,
+      },
+    ]);
+  }, []);
+
+  const addPlanCard = useCallback((nodes: PlanCardNode[], projectId: string) => {
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: buildId(),
+        role: "teacher" as const,
+        content: "",
+        planCard: { nodes, projectId },
+        planCardConfirmed: false,
       },
     ]);
   }, []);
@@ -358,32 +575,179 @@ export function ChatPage() {
     document.documentElement.dataset.theme = APP_CONFIG.theme.defaultTheme;
   }, []);
 
-  const refreshNavigation = useCallback(async () => {
-    try {
-      const projectItems = await listProjects();
-      setProjects(projectItems);
-
-      const conversationsByProject: Record<string, ConversationMeta[]> = {};
-      await Promise.all(
-        projectItems.map(async (project) => {
-          conversationsByProject[project.id] = await getProjectConversations(project.id);
-        })
-      );
-      setProjectConversations(conversationsByProject);
-
-      const standalone = await listStandaloneConversations();
-      setStandaloneConversations(standalone);
-      if (!settings.conversationId && standalone.length > 0) {
-        setConversationId(standalone[0].id);
+  const loadConversationMessages = useCallback(
+    async (
+      conversationId: string | null,
+      options?: { throwOnError?: boolean }
+    ) => {
+      const requestId = ++loadConversationRequestRef.current;
+      if (!conversationId) {
+        if (requestId !== loadConversationRequestRef.current) {
+          return;
+        }
+        setMessages([]);
+        return;
       }
-    } catch (error) {
-      console.error(error);
-    }
-  }, [setConversationId, settings.conversationId]);
+      try {
+        const history = await fetchConversationHistory(conversationId);
+        if (requestId !== loadConversationRequestRef.current) {
+          return;
+        }
+        const baseMessages = buildMessagesFromHistory(history.messages || []);
+        if (history.tool_input_required) {
+          const normalized = normalizeToolInputEvent(history.tool_input_required);
+          baseMessages.push({
+            id: buildId(),
+            role: "teacher",
+            content: "",
+            toolCard: normalized,
+            toolCardSubmitted: false,
+            versions: [""],
+            rawVersions: [undefined],
+            currentVersion: 0,
+          });
+        }
+        setMessages(baseMessages);
+      } catch (error) {
+        console.error(error);
+        if (options?.throwOnError) {
+          throw error;
+        }
+      }
+    },
+    []
+  );
 
   useEffect(() => {
-    void refreshNavigation();
+    sendingRef.current = sending;
+  }, [sending]);
+
+  useEffect(() => {
+    latestConversationIdRef.current = settings.conversationId;
+  }, [settings.conversationId]);
+
+  useEffect(() => {
+    planBuildStateRef.current = planBuildState;
+  }, [planBuildState]);
+
+  const refreshNavigation = useCallback(async (reason: "bootstrap" | "manual" = "manual") => {
+    const isBootstrap = reason === "bootstrap" && !bootstrapCompletedRef.current;
+    const startConversationId = latestConversationIdRef.current;
+    try {
+      if (isBootstrap) {
+        setBootstrapLoading(true);
+        setBootstrapHint(null);
+        setBootstrapStatus("正在加载项目...");
+        setBootstrapProgress(12);
+      }
+      const nav = await fetchNavigation();
+      setProjects(nav.projects);
+      setProjectConversations(nav.project_conversations);
+      setStandaloneConversations(nav.standalone_conversations);
+      if (isBootstrap) {
+        setBootstrapStatus("正在加载历史消息...");
+        setBootstrapProgress(72);
+      }
+
+      const standalone = nav.standalone_conversations;
+      const currentConversationId = latestConversationIdRef.current;
+      let targetConversationId = currentConversationId;
+      if (!startConversationId && !currentConversationId && standalone.length > 0) {
+        commitConversationId(standalone[0].id);
+        targetConversationId = standalone[0].id;
+      }
+      if (isBootstrap && targetConversationId) {
+        setBootstrapStatus("正在加载历史消息...");
+        setBootstrapProgress(84);
+        prevLoadedConversationRef.current = targetConversationId;
+        await loadConversationMessages(targetConversationId, { throwOnError: true });
+      }
+      if (isBootstrap) {
+        setBootstrapProgress(100);
+        setBootstrapStatus("加载完成");
+        bootstrapCompletedRef.current = true;
+        bootstrapRetryAttemptRef.current = 0;
+        setBootstrapLoading(false);
+      }
+      return true;
+    } catch (error) {
+      console.error(error);
+      if (isBootstrap) {
+        setBootstrapLoading(true);
+        setBootstrapStatus("等待服务就绪...");
+        setBootstrapHint("后端尚未完成启动，正在自动重试");
+        setBootstrapProgress((prev) => Math.max(8, Math.min(prev, 24)));
+      }
+      return false;
+    }
+  }, [commitConversationId, loadConversationMessages]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | null = null;
+
+    const bootstrap = async () => {
+      if (cancelled || bootstrapCompletedRef.current) {
+        return;
+      }
+      const ok = await refreshNavigation("bootstrap");
+      if (cancelled || bootstrapCompletedRef.current || ok) {
+        return;
+      }
+      const attempt = bootstrapRetryAttemptRef.current;
+      const delay = Math.min(6000, 1000 * Math.pow(2, attempt));
+      bootstrapRetryAttemptRef.current = attempt + 1;
+      timer = window.setTimeout(() => {
+        void bootstrap();
+      }, delay);
+    };
+
+    void bootstrap();
+
+    return () => {
+      cancelled = true;
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
+    };
   }, [refreshNavigation]);
+
+  const applyPlanTransition = useCallback(
+    async (session: string | null, info: DebugInfo) => {
+      const nextPlan = info.teaching_plan || null;
+      const hasPlanNow = Boolean(nextPlan);
+      const hadPlanBefore = previousPlanExistsRef.current;
+      const conversationId = info.conversation_id || session;
+      const shouldFinalizePlan =
+        hasPlanNow && (!hadPlanBefore || planBuildStateRef.current === "building");
+
+      setTeachingPlan(nextPlan);
+
+      if (shouldFinalizePlan) {
+        maybeShowPlanNotice(conversationId, nextPlan);
+        planBuildStateRef.current = "done";
+        setPlanBuildState("done");
+        await refreshNavigation();
+      }
+
+      previousPlanExistsRef.current = hasPlanNow;
+    },
+    [maybeShowPlanNotice, refreshNavigation]
+  );
+
+  const prevLoadedConversationRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!settings.conversationId) {
+      return;
+    }
+    // Skip if bootstrap already loaded this conversation
+    if (prevLoadedConversationRef.current === settings.conversationId) {
+      return;
+    }
+    prevLoadedConversationRef.current = settings.conversationId;
+    setShowPlanNotice(false);
+    void loadConversationMessages(settings.conversationId);
+  }, [loadConversationMessages, settings.conversationId]);
 
   const refreshDebugInfo = useCallback(
     async (session: string | null) => {
@@ -394,15 +758,13 @@ export function ChatPage() {
         const info = await fetchDebugInfo(session);
         setDebugInfo(info);
         setTeachingPlan(info.teaching_plan || null);
+        previousPlanExistsRef.current = Boolean(info.teaching_plan);
         setMessages((prev) => applyDebugTurns(prev, info));
-        if (info.conversation_id) {
-          setConversationId(info.conversation_id);
-        }
       } catch (error) {
         console.error(error);
       }
     },
-    [settings.devMode, setConversationId]
+    [settings.devMode]
   );
 
   const checkLatestTurnSignals = useCallback(
@@ -412,16 +774,7 @@ export function ChatPage() {
       }
       try {
         const info = await fetchDebugInfo(session);
-        const hasPlanNow = Boolean(info.teaching_plan);
-        const hadPlanBefore = previousPlanExistsRef.current;
-        setTeachingPlan(info.teaching_plan || null);
-        if (!hadPlanBefore && hasPlanNow) {
-          setShowPlanNotice(true);
-          setPlanBuildState("done");
-        } else if (hasPlanNow && planBuildState === "building") {
-          setPlanBuildState("done");
-        }
-        previousPlanExistsRef.current = hasPlanNow;
+        await applyPlanTransition(session, info);
 
         const turns = info.debug_turns || [];
         if (!turns.length) {
@@ -436,9 +789,6 @@ export function ChatPage() {
 
         const raw = latest.response_raw as Record<string, unknown> | undefined;
         const toolRounds = Array.isArray(raw?.tool_rounds) ? raw.tool_rounds : [];
-        if (toolRounds.length > 0 && planBuildState === "idle") {
-          setPlanBuildState("building");
-        }
         for (const round of toolRounds as Array<Record<string, unknown>>) {
           const calls = Array.isArray(round.tool_calls) ? round.tool_calls : [];
           for (const call of calls as Array<Record<string, unknown>>) {
@@ -450,7 +800,7 @@ export function ChatPage() {
         // ignore signal fetch errors
       }
     },
-    [planBuildState, pushToolEvent]
+    [applyPlanTransition, pushToolEvent]
   );
 
   useEffect(() => {
@@ -465,16 +815,7 @@ export function ChatPage() {
         if (cancelled) {
           return;
         }
-        const hasPlanNow = Boolean(info.teaching_plan);
-        const hadPlanBefore = previousPlanExistsRef.current;
-        setTeachingPlan(info.teaching_plan || null);
-        if (!hadPlanBefore && hasPlanNow) {
-          setShowPlanNotice(true);
-          setPlanBuildState("done");
-        } else if (hasPlanNow) {
-          setPlanBuildState("done");
-        }
-        previousPlanExistsRef.current = hasPlanNow;
+        await applyPlanTransition(settings.conversationId, info);
       } catch {
         // ignore polling errors
       }
@@ -489,7 +830,7 @@ export function ChatPage() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [planBuildState, settings.conversationId]);
+  }, [applyPlanTransition, planBuildState, settings.conversationId]);
 
   useEffect(() => {
     if (!settings.devMode) {
@@ -502,14 +843,71 @@ export function ChatPage() {
     if (planBuildState !== "done") {
       return;
     }
-    const timer = window.setTimeout(() => setPlanBuildState("idle"), 2800);
+    const timer = window.setTimeout(() => {
+      planBuildStateRef.current = "idle";
+      setPlanBuildState("idle");
+    }, 2800);
     return () => window.clearTimeout(timer);
   }, [planBuildState]);
+
+  useEffect(() => {
+    if (!showPlanNotice) {
+      return;
+    }
+    const timer = window.setTimeout(() => setShowPlanNotice(false), 8000);
+    return () => window.clearTimeout(timer);
+  }, [showPlanNotice]);
+
+  const findProjectIdByConversation = useCallback(
+    (conversationId: string | null): string | null => {
+      if (!conversationId) return null;
+      for (const [projectId, convs] of Object.entries(projectConversations)) {
+        if (convs.some((c) => c.id === conversationId)) return projectId;
+      }
+      return null;
+    },
+    [projectConversations]
+  );
+
+  const handleToolEvent = useCallback(
+    (tool: { name: string; arguments?: string; result?: string }) => {
+      pushToolEvent(tool.name);
+      if (tool.name === "plan" && tool.result) {
+        try {
+          const parsed = JSON.parse(tool.result);
+          if (parsed.mode === "project" && Array.isArray(parsed.learning_path_draft)) {
+            const projectId = findProjectIdByConversation(
+              latestConversationIdRef.current || settings.conversationId
+            );
+            if (projectId) {
+              addPlanCard(parsed.learning_path_draft, projectId);
+            }
+          }
+        } catch { /* ignore parse errors */ }
+      }
+    },
+    [pushToolEvent, findProjectIdByConversation, settings.conversationId, addPlanCard]
+  );
+
+  const handlePlanConfirm = useCallback(
+    async (projectId: string, nodes: PlanCardNode[]) => {
+      await confirmProjectPlan(projectId, nodes);
+      setMessages((prev) =>
+        prev.map((msg) =>
+          msg.planCard?.projectId === projectId
+            ? { ...msg, planCardConfirmed: true }
+            : msg
+        )
+      );
+      await refreshNavigation();
+    },
+    [refreshNavigation]
+  );
 
   const handleSend = useCallback(
     async (overrideText?: string) => {
       const text = (overrideText ?? input).trim();
-      if ((!text && pendingImages.length === 0) || sending) {
+      if ((!text && pendingImages.length === 0) || sendingRef.current) {
         return;
       }
       setLiveRaw(null);
@@ -525,6 +923,7 @@ export function ChatPage() {
       }
       setPendingImages([]);
 
+      sendingRef.current = true;
       setSending(true);
       const controller = new AbortController();
       activeRequestRef.current = controller;
@@ -546,7 +945,8 @@ export function ChatPage() {
               message: text,
               images: imagesToSend.map((item) => item.dataUrl),
               model: settings.model,
-              conversation_id: settings.conversationId
+              conversation_id: settings.conversationId,
+              thinking: settings.thinking
             },
             (token) => {
               const consumed = consumeStreamChunk(streamThinkState, token);
@@ -568,9 +968,9 @@ export function ChatPage() {
                 )
               );
             },
-            ({ fullContent, thinkingContent, conversationId }) => {
+            ({ fullContent, thinkingContent, conversationId, paused }) => {
               if (conversationId) {
-                setConversationId(conversationId);
+                commitConversationId(conversationId);
                 latestSessionId = conversationId;
               }
               const finalThinking = (thinkingContent || streamThinking).trim();
@@ -578,6 +978,11 @@ export function ChatPage() {
                 finalThinking && !/<think>[\s\S]*?<\/think>/i.test(fullContent)
                   ? `<think>${finalThinking}</think>\n${fullContent}`
                   : fullContent;
+              // Remove empty placeholder when stream paused for a tool card
+              if (paused && !withThinking.trim()) {
+                setMessages((prev) => prev.filter((msg) => msg.id !== assistantId));
+                return;
+              }
               setMessages((prev) =>
                 prev.map((msg) => {
                   if (msg.id !== assistantId) {
@@ -620,9 +1025,7 @@ export function ChatPage() {
                 )
               );
             },
-            (tool) => {
-              pushToolEvent(tool.name);
-            },
+            handleToolEvent,
             (event) => {
               addToolCard(event);
             },
@@ -657,6 +1060,7 @@ export function ChatPage() {
             console.error(error);
           }
         } finally {
+          sendingRef.current = false;
           setSending(false);
           if (activeRequestRef.current === controller) {
             activeRequestRef.current = null;
@@ -681,7 +1085,7 @@ export function ChatPage() {
         );
         latestSessionId = result.conversationId || settings.conversationId;
         if (result.conversationId) {
-          setConversationId(result.conversationId);
+          commitConversationId(result.conversationId);
         }
         setMessages((prev) => [
           ...prev,
@@ -689,6 +1093,10 @@ export function ChatPage() {
         ]);
         if (result.data.tool_input_required) {
           addToolCard(result.data.tool_input_required);
+        }
+        if (result.data.plan_card?.mode === "project" && result.data.plan_card.nodes) {
+          const pid = findProjectIdByConversation(latestSessionId);
+          if (pid) addPlanCard(result.data.plan_card.nodes, pid);
         }
       } catch (error) {
         if (!isAbortError(error)) {
@@ -703,6 +1111,7 @@ export function ChatPage() {
           console.error(error);
         }
       } finally {
+        sendingRef.current = false;
         setSending(false);
         if (activeRequestRef.current === controller) {
           activeRequestRef.current = null;
@@ -711,7 +1120,7 @@ export function ChatPage() {
         await checkLatestTurnSignals(latestSessionId);
       }
     },
-    [checkLatestTurnSignals, input, pendingImages, pushToolEvent, refreshDebugInfo, sending, setConversationId, settings.model, settings.conversationId, settings.streaming]
+    [addPlanCard, checkLatestTurnSignals, commitConversationId, findProjectIdByConversation, input, pendingImages, handleToolEvent, refreshDebugInfo, settings.model, settings.conversationId, settings.streaming]
   );
 
   const getUserTurnByMessageId = useCallback(
@@ -735,11 +1144,14 @@ export function ChatPage() {
       return;
     }
 
-    const lastTeacher = [...messages].reverse().find((msg) => msg.role === "teacher");
+    const lastTeacher = [...messages]
+      .reverse()
+      .find((msg) => msg.role === "teacher" && !msg.toolCard);
     if (!lastTeacher) {
       return;
     }
 
+    clearPlanNoticeFingerprint();
     setSending(true);
     const controller = new AbortController();
     activeRequestRef.current = controller;
@@ -752,7 +1164,7 @@ export function ChatPage() {
         setMessages((prev) =>
           prev.map((msg) =>
             msg.id === lastTeacher.id && msg.role === "teacher"
-              ? { ...msg, isStreaming: true, streamingThinking: "" }
+              ? { ...msg, isStreaming: true, streamingThinking: "", content: "", versions: msg.versions }
               : msg
           )
       );
@@ -788,9 +1200,9 @@ export function ChatPage() {
               )
             );
           },
-          ({ fullContent, thinkingContent, conversationId }) => {
+          ({ fullContent, thinkingContent, conversationId, paused }) => {
             if (conversationId) {
-              setConversationId(conversationId);
+              commitConversationId(conversationId);
               latestSessionId = conversationId;
             }
             const finalThinking = (thinkingContent || streamThinking).trim();
@@ -798,6 +1210,16 @@ export function ChatPage() {
               finalThinking && !/<think>[\s\S]*?<\/think>/i.test(fullContent)
                 ? `<think>${finalThinking}</think>\n${fullContent}`
                 : fullContent;
+            if (paused && !withThinking.trim()) {
+              // Restore the message from its previous version instead of removing it
+              setMessages((prev) => prev.map((msg) => {
+                if (msg.id !== lastTeacher.id || msg.role !== "teacher") return msg;
+                const versions = msg.versions || [];
+                const idx = msg.currentVersion ?? (versions.length - 1);
+                return { ...msg, isStreaming: false, streamingThinking: undefined, content: versions[idx] ?? "" };
+              }));
+              return;
+            }
             setMessages((prev) => {
               const target = prev.find((msg) => msg.id === lastTeacher.id);
               const cleared = prev.map((msg) =>
@@ -841,13 +1263,11 @@ export function ChatPage() {
               )
             );
           },
-          (tool) => {
-            pushToolEvent(tool.name);
-          },
+          handleToolEvent,
           (event) => {
             addToolCard(event);
           },
-          { signal: controller.signal }
+          { signal: controller.signal, thinking: settings.thinking }
         );
       } catch (error) {
         if (isAbortError(error)) {
@@ -875,10 +1295,10 @@ export function ChatPage() {
     }
 
     try {
-      const result = await retryLastReply(settings.conversationId, settings.model, { signal: controller.signal });
+      const result = await retryLastReply(settings.conversationId, settings.model, { signal: controller.signal, thinking: settings.thinking });
       const latestSessionId = result.conversationId || settings.conversationId;
       if (result.conversationId) {
-        setConversationId(result.conversationId);
+        commitConversationId(result.conversationId);
       }
       setMessages((prev) => {
         const target = prev.find((msg) => msg.id === lastTeacher.id);
@@ -893,6 +1313,10 @@ export function ChatPage() {
       });
       if (result.data.tool_input_required) {
         addToolCard(result.data.tool_input_required);
+      }
+      if (result.data.plan_card?.mode === "project" && result.data.plan_card.nodes) {
+        const pid = findProjectIdByConversation(latestSessionId);
+        if (pid) addPlanCard(result.data.plan_card.nodes, pid);
       }
       await refreshDebugInfo(latestSessionId);
       await checkLatestTurnSignals(latestSessionId);
@@ -918,7 +1342,7 @@ export function ChatPage() {
         activeRequestRef.current = null;
       }
     }
-  }, [checkLatestTurnSignals, messages, pushToolEvent, refreshDebugInfo, sending, setConversationId, settings.model, settings.conversationId, settings.streaming]);
+  }, [addPlanCard, checkLatestTurnSignals, clearPlanNoticeFingerprint, commitConversationId, findProjectIdByConversation, messages, handleToolEvent, refreshDebugInfo, sending, settings.model, settings.conversationId, settings.streaming]);
 
   const handleEditSave = useCallback(
     async (messageId: string, value: string) => {
@@ -930,6 +1354,8 @@ export function ChatPage() {
       if (targetTurn < 1) {
         return;
       }
+
+      clearPlanNoticeFingerprint();
 
       const originalMsg = messages.find((msg) => msg.id === messageId);
       const originalImageUrls = originalMsg?.images?.map((img) => img.dataUrl) ?? [];
@@ -972,7 +1398,8 @@ export function ChatPage() {
               target_user_turn: targetTurn,
               replacement_message: value,
               images: originalImageUrls.length > 0 ? originalImageUrls : undefined,
-              model: settings.model
+              model: settings.model,
+              thinking: settings.thinking,
             },
             (token) => {
               const consumed = consumeStreamChunk(streamThinkState, token);
@@ -1002,9 +1429,9 @@ export function ChatPage() {
                 )
               );
             },
-            ({ fullContent, thinkingContent, conversationId }) => {
+            ({ fullContent, thinkingContent, conversationId, paused }) => {
               if (conversationId) {
-                setConversationId(conversationId);
+                commitConversationId(conversationId);
                 latestSessionId = conversationId;
               }
               const finalThinking = (thinkingContent || streamThinking).trim();
@@ -1012,6 +1439,10 @@ export function ChatPage() {
                 finalThinking && !/<think>[\s\S]*?<\/think>/i.test(fullContent)
                   ? `<think>${finalThinking}</think>\n${fullContent}`
                   : fullContent;
+              if (paused && !withThinking.trim()) {
+                setMessages((prev) => prev.filter((msg) => msg.id !== targetTeacherId));
+                return;
+              }
               setMessages((prev) =>
                 appendVersionToTurn(prev, "teacher", targetTurn, withThinking).map((msg) =>
                   msg.id === targetTeacherId && msg.role === "teacher"
@@ -1039,9 +1470,7 @@ export function ChatPage() {
                 )
               );
             },
-          (tool) => {
-            pushToolEvent(tool.name);
-          },
+          handleToolEvent,
           (event) => {
             addToolCard(event);
           },
@@ -1071,12 +1500,13 @@ export function ChatPage() {
           target_user_turn: targetTurn,
           replacement_message: value,
           images: originalImageUrls.length > 0 ? originalImageUrls : undefined,
-          model: settings.model
+          model: settings.model,
+          thinking: settings.thinking,
         }, { signal: controller.signal });
         const latestSessionId = result.conversationId || settings.conversationId;
 
         if (result.conversationId) {
-          setConversationId(result.conversationId);
+          commitConversationId(result.conversationId);
         }
 
         setMessages((prev) => {
@@ -1086,6 +1516,10 @@ export function ChatPage() {
         });
         if (result.data.tool_input_required) {
           addToolCard(result.data.tool_input_required);
+        }
+        if (result.data.plan_card?.mode === "project" && result.data.plan_card.nodes) {
+          const pid = findProjectIdByConversation(latestSessionId);
+          if (pid) addPlanCard(result.data.plan_card.nodes, pid);
         }
         await refreshDebugInfo(latestSessionId);
         await checkLatestTurnSignals(latestSessionId);
@@ -1102,7 +1536,7 @@ export function ChatPage() {
         }
       }
     },
-    [checkLatestTurnSignals, getUserTurnByMessageId, messages, pushToolEvent, refreshDebugInfo, sending, setConversationId, settings.model, settings.conversationId, settings.streaming]
+    [addPlanCard, checkLatestTurnSignals, clearPlanNoticeFingerprint, commitConversationId, findProjectIdByConversation, getUserTurnByMessageId, messages, handleToolEvent, refreshDebugInfo, sending, settings.model, settings.conversationId, settings.streaming]
   );
 
   const handleToolSubmit = useCallback(
@@ -1157,9 +1591,9 @@ export function ChatPage() {
                 )
               );
             },
-            ({ fullContent, thinkingContent, conversationId }) => {
+            ({ fullContent, thinkingContent, conversationId, paused }) => {
               if (conversationId) {
-                setConversationId(conversationId);
+                commitConversationId(conversationId);
                 latestSessionId = conversationId;
               }
               const finalThinking = (thinkingContent || streamThinking).trim();
@@ -1167,6 +1601,10 @@ export function ChatPage() {
                 finalThinking && !/<think>[\s\S]*?<\/think>/i.test(fullContent)
                   ? `<think>${finalThinking}</think>\n${fullContent}`
                   : fullContent;
+              if (paused && !withThinking.trim()) {
+                setMessages((prev) => prev.filter((m) => m.id !== assistantId));
+                return;
+              }
               setMessages((prev) =>
                 prev.map((m) =>
                   m.id === assistantId
@@ -1202,10 +1640,8 @@ export function ChatPage() {
                 )
               );
             },
-            (tool) => {
-              pushToolEvent(tool.name);
-            },
-            { signal: controller.signal }
+            handleToolEvent,
+            { signal: controller.signal, thinking: settings.thinking }
           );
           await refreshDebugInfo(latestSessionId);
           await checkLatestTurnSignals(latestSessionId);
@@ -1215,15 +1651,19 @@ export function ChatPage() {
             answers,
             settings.model,
             settings.conversationId,
-            { signal: controller.signal }
+            { signal: controller.signal, thinking: settings.thinking }
           );
           if (result.conversationId) {
-            setConversationId(result.conversationId);
+            commitConversationId(result.conversationId);
           }
           if (result.data.tool_input_required) {
             addToolCard(result.data.tool_input_required);
           } else {
             setMessages((prev) => [...prev, createVersionedMessage("teacher", result.data.reply)]);
+          }
+          if (result.data.plan_card?.mode === "project" && result.data.plan_card.nodes) {
+            const pid = findProjectIdByConversation(result.conversationId || settings.conversationId);
+            if (pid) addPlanCard(result.data.plan_card.nodes, pid);
           }
           await refreshDebugInfo(result.conversationId || settings.conversationId);
           await checkLatestTurnSignals(result.conversationId || settings.conversationId);
@@ -1242,11 +1682,13 @@ export function ChatPage() {
       }
     },
     [
+      addPlanCard,
       addToolCard,
       checkLatestTurnSignals,
-      pushToolEvent,
+      findProjectIdByConversation,
+      handleToolEvent,
       refreshDebugInfo,
-      setConversationId,
+      commitConversationId,
       settings.model,
       settings.conversationId,
       settings.streaming,
@@ -1254,64 +1696,91 @@ export function ChatPage() {
     ]
   );
 
+  const [creating, setCreating] = useState(false);
+  const creatingRef = useRef(false);
+
   const handleCreateProject = useCallback(async () => {
-    const title = window.prompt("请输入项目标题");
-    if (!title || !title.trim()) {
-      return;
-    }
+    if (creatingRef.current) return;
+    creatingRef.current = true;
+    setCreating(true);
     try {
-      const created = await createProject({ title: title.trim() });
-      setConversationId(created.planning_conversation.id);
+      const created = await createProject({});
+      prevLoadedConversationRef.current = created.planning_conversation.id;
+      commitConversationId(created.planning_conversation.id);
+      setMessages([]);
+      setDebugInfo(null);
+      setTeachingPlan(null);
       await refreshNavigation();
-      setMessages([
-        {
-          id: buildId(),
-          role: "teacher",
-          content: APP_CONFIG.text.initialTeacherMessage
-        }
-      ]);
     } catch (error) {
       console.error(error);
+    } finally {
+      creatingRef.current = false;
+      setCreating(false);
     }
-  }, [refreshNavigation, setConversationId]);
+  }, [commitConversationId, refreshNavigation]);
 
   const handleCreateStandaloneConversation = useCallback(async () => {
+    if (creatingRef.current) return;
+    creatingRef.current = true;
+    setCreating(true);
     try {
       const created = await createStandaloneConversation({ title: "独立会话" });
-      setConversationId(created.id);
+      prevLoadedConversationRef.current = created.id;
+      commitConversationId(created.id);
+      setMessages([]);
+      setDebugInfo(null);
+      setTeachingPlan(null);
       await refreshNavigation();
-      setMessages([
-        {
-          id: buildId(),
-          role: "teacher",
-          content: APP_CONFIG.text.initialTeacherMessage
-        }
-      ]);
     } catch (error) {
       console.error(error);
+    } finally {
+      creatingRef.current = false;
+      setCreating(false);
     }
-  }, [refreshNavigation, setConversationId]);
+  }, [commitConversationId, refreshNavigation]);
+
+  const handleDeleteConversation = useCallback(async (conversationId: string) => {
+    await deleteConversation(conversationId);
+    if (settings.conversationId === conversationId) {
+      prevLoadedConversationRef.current = null;
+      commitConversationId(null);
+      setMessages([]);
+      setDebugInfo(null);
+      setTeachingPlan(null);
+    }
+    await refreshNavigation();
+  }, [settings.conversationId, commitConversationId, refreshNavigation]);
+
+  const handleDeleteProject = useCallback(async (projectId: string) => {
+    const projectConvIds = (projectConversations[projectId] || []).map((c) => c.id);
+    await deleteProject(projectId);
+    if (settings.conversationId && projectConvIds.includes(settings.conversationId)) {
+      prevLoadedConversationRef.current = null;
+      commitConversationId(null);
+      setMessages([]);
+      setDebugInfo(null);
+      setTeachingPlan(null);
+    }
+    await refreshNavigation();
+  }, [settings.conversationId, projectConversations, commitConversationId, refreshNavigation]);
 
   const handleSelectConversation = useCallback(
     async (conversationId: string) => {
       if (settings.conversationId === conversationId) {
         return;
       }
-      setConversationId(conversationId);
-      setMessages([
-        {
-          id: buildId(),
-          role: "teacher",
-          content: APP_CONFIG.text.initialTeacherMessage
-        }
-      ]);
+      prevLoadedConversationRef.current = conversationId;
+      commitConversationId(conversationId);
+      await loadConversationMessages(conversationId);
       setDebugInfo(null);
       await refreshDebugInfo(conversationId);
     },
-    [refreshDebugInfo, setConversationId, settings.conversationId]
+    [commitConversationId, loadConversationMessages, refreshDebugInfo, settings.conversationId]
   );
 
-  const lastAssistantId = [...messages].reverse().find((msg) => msg.role === "teacher")?.id ?? null;
+  const lastAssistantId = [...messages]
+    .reverse()
+    .find((msg) => msg.role === "teacher" && !msg.toolCard)?.id ?? null;
   const handlePrevVersion = useCallback((messageId: string) => {
     setMessages((prev) => cycleMessageVersion(prev, messageId, -1));
   }, []);
@@ -1321,6 +1790,7 @@ export function ChatPage() {
   const handleAbort = useCallback(() => {
     activeRequestRef.current?.abort();
     setMessages((prev) => prev.map((msg) => finalizeStreamingMessage(msg)));
+    sendingRef.current = false;
     setSending(false);
     setSubmittingToolAnswer(false);
     setLiveRaw(null);
@@ -1332,6 +1802,7 @@ export function ChatPage() {
 
       <ChatSidebar
         onOpenSettings={() => setShowSettings(true)}
+        onOpenConversationManager={() => setShowConversationManager(true)}
         projects={projects}
         standaloneConversations={standaloneConversations}
         activeConversationId={settings.conversationId}
@@ -1339,9 +1810,24 @@ export function ChatPage() {
         onSelectConversation={handleSelectConversation}
         onCreateProject={handleCreateProject}
         onCreateConversation={handleCreateStandaloneConversation}
+        creating={creating}
       />
 
       <section className="relative z-10 flex flex-1 flex-col overflow-hidden">
+        {bootstrapLoading && (
+          <div className="pointer-events-none absolute inset-x-0 top-0 z-[60]">
+            <div className="h-1 w-full bg-app-border/30">
+              <div
+                className="h-full bg-app-accent transition-[width] duration-300 ease-out"
+                style={{ width: `${Math.max(6, Math.min(100, bootstrapProgress))}%` }}
+              />
+            </div>
+            <div className="border-b border-app-border/25 bg-app-surface/80 px-3 py-1 text-[11px] text-app-muted backdrop-blur-sm md:px-6">
+              {bootstrapStatus}
+              {bootstrapHint ? ` · ${bootstrapHint}` : ""}
+            </div>
+          </div>
+        )}
         {planBuildState !== "idle" && (
           <div className="absolute left-1/2 top-4 z-40 -translate-x-1/2">
             <div className="rounded-full border border-app-info/35 bg-app-surface/90 px-4 py-1.5 text-xs text-app-info shadow-[var(--app-shadow-teacher)] backdrop-blur-md">
@@ -1395,6 +1881,21 @@ export function ChatPage() {
           </div>
         </div>
 
+        <div className="relative z-20 flex items-center justify-end gap-2 px-8 pb-2 pt-2 md:px-24">
+          <button
+            type="button"
+            disabled={!teachingPlan}
+            onClick={() => setShowPlanPanel(true)}
+            className={
+              teachingPlan
+                ? "rounded border border-app-info/40 bg-app-info/10 px-3 py-1.5 text-xs text-app-info transition-colors hover:bg-app-info/20"
+                : "cursor-not-allowed rounded border border-app-border/35 bg-app-surface/60 px-3 py-1.5 text-xs text-app-muted/70"
+            }
+          >
+            {teachingPlan ? "查看学习计划" : "暂无学习计划"}
+          </button>
+        </div>
+
         <div className="relative z-10 flex-1 overflow-y-auto space-y-2 px-8 pb-56 pt-16 md:px-24">
           <div className="mx-auto flex w-full max-w-5xl flex-col gap-6">
             {messages.map((message) => (
@@ -1408,6 +1909,7 @@ export function ChatPage() {
                 onPrevVersion={() => handlePrevVersion(message.id)}
                 onNextVersion={() => handleNextVersion(message.id)}
                 onToolSubmit={handleToolSubmit}
+                onPlanConfirm={handlePlanConfirm}
               />
             ))}
             <div ref={messageEndRef} />
@@ -1431,7 +1933,16 @@ export function ChatPage() {
 
       <SettingsPanel open={showSettings} onClose={() => setShowSettings(false)} />
       <TeachingPlanCard open={showPlanPanel} plan={teachingPlan || null} onClose={() => setShowPlanPanel(false)} />
+      <ConversationManager
+        open={showConversationManager}
+        onClose={() => setShowConversationManager(false)}
+        projects={projects}
+        projectConversations={projectConversations}
+        standaloneConversations={standaloneConversations}
+        activeConversationId={settings.conversationId}
+        onDeleteConversation={handleDeleteConversation}
+        onDeleteProject={handleDeleteProject}
+      />
     </main>
   );
 }
-

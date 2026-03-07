@@ -3,8 +3,23 @@ export interface ParsedMessage {
   visible: string;
 }
 
-export function parseThinking(raw: string): ParsedMessage {
-  const matches = [...raw.matchAll(/<think>([\s\S]*?)<\/think>/gi)];
+function normalizeText(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value == null) {
+    return "";
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+export function parseThinking(raw: unknown): ParsedMessage {
+  const text = normalizeText(raw);
+  const matches = [...text.matchAll(/<think>([\s\S]*?)<\/think>/gi)];
   const thinking = matches
     .map((match) => match[1]?.trim())
     .filter((item): item is string => Boolean(item))
@@ -12,6 +27,6 @@ export function parseThinking(raw: string): ParsedMessage {
     .trim();
   return {
     thinking: thinking || null,
-    visible: raw.replace(/<think>[\s\S]*?<\/think>/gi, "").trim()
+    visible: text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim()
   };
 }

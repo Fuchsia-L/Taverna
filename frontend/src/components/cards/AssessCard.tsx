@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 interface AssessCardProps {
   tool: "assess" | "quiz";
@@ -23,11 +23,27 @@ export function AssessCard({
   submitted = false,
   initialAnswers = [],
 }: AssessCardProps) {
+  const safeQuestions = Array.isArray(questions) ? questions : [];
   const [answers, setAnswers] = useState<Array<{ question: string; answer: string }>>(
     initialAnswers.length
       ? initialAnswers
-      : questions.map((q) => ({ question: q.question, answer: "" }))
+      : safeQuestions.map((q) => ({ question: q.question, answer: "" }))
   );
+
+  useEffect(() => {
+    if (submitted) {
+      return;
+    }
+    setAnswers((prev) => {
+      if (prev.length === safeQuestions.length) {
+        return prev;
+      }
+      return safeQuestions.map((q, idx) => ({
+        question: q.question,
+        answer: prev[idx]?.answer || "",
+      }));
+    });
+  }, [safeQuestions, submitted]);
 
   const title = useMemo(() => {
     if (tool === "quiz") {
@@ -36,11 +52,18 @@ export function AssessCard({
     return "📋 诊断问题";
   }, [phaseId, tool]);
 
+  const canSubmit = useMemo(() => {
+    if (submitted || safeQuestions.length === 0) {
+      return false;
+    }
+    return answers.length === safeQuestions.length && answers.every((item) => item.answer.trim().length > 0);
+  }, [answers, safeQuestions.length, submitted]);
+
   return (
     <div className="mt-3 rounded-xl border border-app-info/35 bg-app-bg/35 p-3">
       <div className="mb-3 text-sm font-medium text-app-info">{title}</div>
       <div className="space-y-3">
-        {questions.map((q, index) => (
+        {safeQuestions.map((q, index) => (
           <div key={`${toolCallId}_${index}`} className="space-y-1">
             <div className="text-sm text-app-text">{index + 1}. {q.question}</div>
             <textarea
@@ -60,7 +83,7 @@ export function AssessCard({
       <div className="mt-3 flex justify-end">
         <button
           type="button"
-          disabled={submitted}
+          disabled={!canSubmit}
           onClick={() => onSubmit(toolCallId, answers)}
           className="rounded border border-app-info/40 bg-app-info/15 px-3 py-1.5 text-xs text-app-info hover:bg-app-info/25 disabled:cursor-not-allowed disabled:opacity-50"
         >

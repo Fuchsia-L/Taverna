@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import GlobalMemory
@@ -19,9 +20,16 @@ async def get_or_create_global_memory(db: AsyncSession, user_id: str) -> GlobalM
         learner_profile={},
     )
     db.add(memory)
-    await db.commit()
-    await db.refresh(memory)
-    return memory
+    try:
+        await db.commit()
+        await db.refresh(memory)
+        return memory
+    except IntegrityError:
+        await db.rollback()
+        existing = await db.scalar(select(GlobalMemory).where(GlobalMemory.user_id == user_id))
+        if existing:
+            return existing
+        raise
 
 
 async def update_mastery(

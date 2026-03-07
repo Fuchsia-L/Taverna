@@ -6,7 +6,16 @@
       "Bash(python -c \"import py_compile; py_compile.compile\\(''api/chat.py'', doraise=True\\); print\\(''Backend OK''\\)\")",
       "Bash(npx tsc --noEmit)",
       "Bash(cat \"d:/_PROJECTS/Taverna/frontend/src/services/\"*.ts)",
-      "Bash(python -c \"import py_compile; py_compile.compile\\(''models/chat.py'', doraise=True\\); py_compile.compile\\(''api/chat.py'', doraise=True\\); print\\(''Backend OK''\\)\")"
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''models/chat.py'', doraise=True\\); py_compile.compile\\(''api/chat.py'', doraise=True\\); print\\(''Backend OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''api/chat.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''AST parse: OK''\\)\")",
+      "Bash(python -c \"from api import chat; print\\(''Import: OK''\\)\")",
+      "Bash(source .venv/Scripts/activate)",
+      "Bash(python -c \"from api import chat; print\\(''OK''\\)\")",
+      "Bash(python -c \"from core.tool_handler import handle_tool_call; from core.tool_definitions import TEACHING_TOOLS; print\\(''OK''\\)\")",
+      "Bash(npx tsc --noEmit --pretty)",
+      "Bash(xargs ls -la)",
+      "Bash(npx vite build)",
+      "Bash(python -c \"import api.project; import core.conversation; print\\(''OK''\\)\")"
     ]
   }
 }

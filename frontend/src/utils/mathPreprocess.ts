@@ -4,8 +4,23 @@ function preprocessPlainText(segment: string): string {
     .replace(/\\\(([\s\S]*?)\\\)/g, (_, inner: string) => `$${inner}$`);
 }
 
-export function preprocessLaTeX(content: string): string {
-  const fencedParts = content.split(/(```[\s\S]*?```)/g);
+function normalizeText(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value == null) {
+    return "";
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+export function preprocessLaTeX(content: unknown): string {
+  const text = normalizeText(content);
+  const fencedParts = text.split(/(```[\s\S]*?```)/g);
   return fencedParts
     .map((fencedPart) => {
       if (fencedPart.startsWith("```") && fencedPart.endsWith("```")) {
@@ -23,4 +38,3 @@ export function preprocessLaTeX(content: string): string {
     })
     .join("");
 }
-

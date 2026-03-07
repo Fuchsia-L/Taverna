@@ -1,13 +1,9 @@
-import os
+import logging
+import re
 
-from dotenv import load_dotenv
-from openai import OpenAI
+from core.providers import get_async_client_for_model, load_config, resolve_model
 
-load_dotenv()
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-)
+logger = logging.getLogger(__name__)
 
 COMPRESS_PROMPT = """你是一个教学对话摘要助手。请将以下师生对话压缩成简洁的摘要。
 
@@ -22,9 +18,12 @@ COMPRESS_PROMPT = """你是一个教学对话摘要助手。请将以下师生�
 """
 
 
+_THINK_RE = re.compile(r"<think>[\s\S]*?</think>\s*", re.IGNORECASE)
+
+
 def _content_to_text(content) -> str:
     if isinstance(content, str):
-        return content
+        return _THINK_RE.sub("", content)
     if isinstance(content, list):
         parts: list[str] = []
         for item in content:
@@ -34,14 +33,14 @@ def _content_to_text(content) -> str:
             if item_type in ("text", "input_text"):
                 text = item.get("text")
                 if isinstance(text, str):
-                    parts.append(text)
+                    parts.append(_THINK_RE.sub("", text))
             elif item_type in ("image_url", "input_image"):
                 parts.append("[图片]")
         return "\n".join(parts)
     return str(content)
 
 
-def compress_messages(messages: list[dict]) -> str:
+async def compress_messages(messages: list[dict]) -> str:
     """
     Send older messages to AI for compression into a summary.
     Returns the summary string.
@@ -57,8 +56,17 @@ def compress_messages(messages: list[dict]) -> str:
         conversation_text += f"{role_label}：{_content_to_text(msg['content'])}\n"
 
     try:
-        response = client.chat.completions.create(
-            model=os.getenv("MODEL_NAME", "gpt-4o-mini"),
+        config = load_config()
+        compressor_model = config.get("compressor_model") or config.get("default_model")
+        # Validate that the model actually exists in enabled_models; fall back to any available model
+        try:
+            compressor_model = resolve_model(compressor_model)
+        except ValueError:
+            logger.warning("No valid compressor model found, skipping compression")
+            return ""
+        client = get_async_client_for_model(compressor_model)
+        response = await client.chat.completions.create(
+            model=compressor_model,
             messages=[
                 {
                     "role": "system",
@@ -73,5 +81,5 @@ def compress_messages(messages: list[dict]) -> str:
         )
         return response.choices[0].message.content or ""
     except Exception:
-        # If compression fails, fall back to crude truncation
-        return conversation_text[:500] + "\n...(压缩失败，截断保留)"
+        logger.exception("Compression failed, returning empty summary")
+        return ""

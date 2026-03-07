@@ -20,13 +20,20 @@ def _is_missing_pending_table_error(exc: Exception) -> bool:
     return "pending_tool_calls" in text and ("does not exist" in text or "undefinedtable" in text)
 
 
-def _set_fallback(conversation_id: str, tool_call_id: str, tool_name: str, messages_snapshot: list[dict], input_request: dict | None, message_count: int | None = None):
+def _set_fallback(
+    conversation_id: str, tool_call_id: str, tool_name: str,
+    messages_snapshot: list[dict], input_request: dict | None,
+    message_count: int | None = None,
+    deferred_plan: dict | None = None, deferred_advance: dict | None = None,
+):
     _pending_tools_fallback[conversation_id] = {
         "tool_call_id": tool_call_id,
         "tool_name": tool_name,
         "messages": deepcopy(messages_snapshot),
         "input_request": deepcopy(input_request or {}),
         "message_count": message_count,
+        "deferred_plan": deepcopy(deferred_plan) if deferred_plan else None,
+        "deferred_advance": deepcopy(deferred_advance) if deferred_advance else None,
     }
 
 
@@ -44,16 +51,22 @@ async def set_pending_tool(
     messages_snapshot: list[dict],
     input_request: dict | None = None,
     message_count: int | None = None,
+    deferred_plan: dict | None = None,
+    deferred_advance: dict | None = None,
 ):
     conv_uuid = _parse_conversation_uuid(conversation_id)
     if not conv_uuid:
-        _set_fallback(conversation_id, tool_call_id, tool_name, messages_snapshot, input_request, message_count)
+        _set_fallback(conversation_id, tool_call_id, tool_name, messages_snapshot, input_request, message_count, deferred_plan, deferred_advance)
         return
 
     payload_messages = deepcopy(messages_snapshot)
     payload_input = deepcopy(input_request or {})
     if message_count is not None:
         payload_input["_message_count"] = message_count
+    if deferred_plan:
+        payload_input["_deferred_plan"] = deepcopy(deferred_plan)
+    if deferred_advance:
+        payload_input["_deferred_advance"] = deepcopy(deferred_advance)
 
     try:
         async with SessionLocal() as db:
@@ -89,7 +102,16 @@ async def set_pending_tool(
                 await db.commit()
     except ProgrammingError as exc:
         if _is_missing_pending_table_error(exc):
-            _set_fallback(conversation_id, tool_call_id, tool_name, messages_snapshot, input_request)
+            _set_fallback(
+                conversation_id,
+                tool_call_id,
+                tool_name,
+                messages_snapshot,
+                input_request,
+                message_count,
+                deferred_plan,
+                deferred_advance,
+            )
             return
         raise
 
@@ -107,12 +129,16 @@ async def get_pending_tool(conversation_id: str) -> Optional[dict]:
                 return deepcopy(fallback) if fallback else None
             input_req = deepcopy(row.input_request or {})
             stored_count = input_req.pop("_message_count", None)
+            stored_deferred_plan = input_req.pop("_deferred_plan", None)
+            stored_deferred_advance = input_req.pop("_deferred_advance", None)
             return {
                 "tool_call_id": row.tool_call_id,
                 "tool_name": row.tool_name,
                 "messages": deepcopy(row.messages_snapshot or []),
                 "input_request": input_req,
                 "message_count": stored_count,
+                "deferred_plan": stored_deferred_plan,
+                "deferred_advance": stored_deferred_advance,
             }
     except ProgrammingError as exc:
         if _is_missing_pending_table_error(exc):

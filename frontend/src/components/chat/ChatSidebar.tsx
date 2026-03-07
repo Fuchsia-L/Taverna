@@ -1,10 +1,11 @@
-import { BookOpen, ChevronDown, ChevronRight, FolderKanban, Plus, Settings, Sparkles, Terminal } from "lucide-react";
+import { BookOpen, ChevronDown, ChevronRight, FolderKanban, ListX, Plus, Settings, Sparkles, Terminal } from "lucide-react";
 import { useState } from "react";
 import { APP_CONFIG } from "@/config/app";
 import { ConversationMeta, ProjectSummary } from "@/services/chatApi";
 
 interface ChatSidebarProps {
   onOpenSettings: () => void;
+  onOpenConversationManager: () => void;
   projects: ProjectSummary[];
   standaloneConversations: ConversationMeta[];
   activeConversationId: string | null;
@@ -12,10 +13,12 @@ interface ChatSidebarProps {
   onSelectConversation: (conversationId: string) => void;
   onCreateProject: () => void;
   onCreateConversation: () => void;
+  creating?: boolean;
 }
 
 export function ChatSidebar({
   onOpenSettings,
+  onOpenConversationManager,
   projects,
   standaloneConversations,
   activeConversationId,
@@ -23,6 +26,7 @@ export function ChatSidebar({
   onSelectConversation,
   onCreateProject,
   onCreateConversation,
+  creating,
 }: ChatSidebarProps) {
   const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>({});
 
@@ -108,7 +112,8 @@ export function ChatSidebar({
           <button
             type="button"
             onClick={onCreateProject}
-            className="flex flex-1 items-center justify-center gap-1 rounded border border-app-border/30 px-2 py-2 text-xs text-app-muted hover:text-app-info"
+            disabled={creating}
+            className="flex flex-1 items-center justify-center gap-1 rounded border border-app-border/30 px-2 py-2 text-xs text-app-muted hover:text-app-info disabled:opacity-40 disabled:pointer-events-none"
           >
             <Plus size={12} />
             新建项目
@@ -116,10 +121,19 @@ export function ChatSidebar({
           <button
             type="button"
             onClick={onCreateConversation}
-            className="flex flex-1 items-center justify-center gap-1 rounded border border-app-border/30 px-2 py-2 text-xs text-app-muted hover:text-app-info"
+            disabled={creating}
+            className="flex flex-1 items-center justify-center gap-1 rounded border border-app-border/30 px-2 py-2 text-xs text-app-muted hover:text-app-info disabled:opacity-40 disabled:pointer-events-none"
           >
             <Plus size={12} />
             新建会话
+          </button>
+          <button
+            type="button"
+            onClick={onOpenConversationManager}
+            className="flex items-center justify-center rounded border border-app-border/30 px-2 py-2 text-xs text-app-muted hover:text-red-400/80"
+            title="管理会话"
+          >
+            <ListX size={12} />
           </button>
         </div>
 

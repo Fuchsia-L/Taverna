@@ -40,7 +40,7 @@ export function TeachingPlanCard({ open, plan, onClose }: TeachingPlanCardProps)
         onClick={onClose}
         aria-label="close-overlay"
       />
-      <aside className="h-full w-full max-w-md border-l border-app-border/40 bg-app-surface/95 p-5 shadow-2xl backdrop-blur-xl">
+      <aside className="flex h-full w-full max-w-md flex-col border-l border-app-border/40 bg-app-surface/95 p-5 shadow-2xl backdrop-blur-xl">
         <div className="mb-4 flex items-center justify-between">
           <h3 className="text-sm font-semibold tracking-wide text-app-text">教学计划</h3>
           <button
@@ -52,23 +52,25 @@ export function TeachingPlanCard({ open, plan, onClose }: TeachingPlanCardProps)
           </button>
         </div>
 
-        <div className="mb-4 rounded-lg border border-app-border/35 bg-app-bg/35 p-3">
-          <div className="mb-1 text-[11px] uppercase tracking-widest text-app-muted/75">目标</div>
-          <div className="text-sm text-app-text">{plan.goal}</div>
-        </div>
+        <div className="flex-1 overflow-y-auto">
+          <div className="mb-4 rounded-lg border border-app-border/35 bg-app-bg/35 p-3">
+            <div className="mb-1 text-[11px] uppercase tracking-widest text-app-muted/75">目标</div>
+            <div className="text-sm text-app-text">{plan.goal}</div>
+          </div>
 
-        <div className="space-y-3">
-          {plan.phases.map((phase) => (
-            <div key={phase.id} className={`rounded-lg border p-3 ${statusClass(phase.status)}`}>
-              <div className="mb-1 flex items-center justify-between">
-                <div className="text-sm font-medium">
-                  阶段{phase.id} · {phase.title}
+          <div className="space-y-3">
+            {plan.phases.map((phase) => (
+              <div key={phase.id} className={`rounded-lg border p-3 ${statusClass(phase.status)}`}>
+                <div className="mb-1 flex items-center justify-between">
+                  <div className="text-sm font-medium">
+                    阶段{phase.id} · {phase.title}
+                  </div>
+                  <div className="text-[11px]">{statusText(phase.status)}</div>
                 </div>
-                <div className="text-[11px]">{statusText(phase.status)}</div>
+                {phase.summary && <div className="mt-1 text-xs opacity-85">小结：{phase.summary}</div>}
               </div>
-              {phase.summary && <div className="mt-1 text-xs opacity-85">小结：{phase.summary}</div>}
-            </div>
-          ))}
+            ))}
+          </div>
         </div>
       </aside>
     </div>

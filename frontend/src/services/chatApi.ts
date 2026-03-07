@@ -6,11 +6,13 @@ export interface ChatRequestPayload {
   images?: string[];
   model?: string;
   conversation_id?: string | null;
+  thinking?: boolean;
 }
 
 export interface ChatResponsePayload {
   reply: string;
   tool_input_required?: ToolInputEvent;
+  plan_card?: { nodes: Array<{ id: string; title: string; objective: string; status?: "pending" | "active" | "completed" }>; mode: string };
 }
 
 export interface ChatApiResult {
@@ -86,6 +88,17 @@ export interface ConversationMeta {
   objective?: string | null;
   node_id?: string | null;
   status: "active" | "completed" | "abandoned";
+}
+
+export interface HistoryMessagePayload {
+  role: "user" | "assistant" | "system";
+  content: unknown;
+}
+
+export interface ConversationHistoryResponse {
+  conversation_id: string;
+  messages: HistoryMessagePayload[];
+  tool_input_required?: ToolInputEvent;
 }
 
 const api = APP_CONFIG.apiBaseUrl;
@@ -244,8 +257,19 @@ export async function fetchDebugInfo(conversationId?: string | null): Promise<De
   return (await response.json()) as DebugInfo;
 }
 
+export async function fetchConversationHistory(
+  conversationId?: string | null
+): Promise<ConversationHistoryResponse> {
+  const query = conversationId ? `?conversation_id=${encodeURIComponent(conversationId)}` : "";
+  const response = await fetch(`${api}/api/chat/history${query}`);
+  if (!response.ok) {
+    throw new Error(`History API failed with status ${response.status}`);
+  }
+  return (await response.json()) as ConversationHistoryResponse;
+}
+
 export async function createProject(payload: {
-  title: string;
+  title?: string;
   description?: string;
 }): Promise<{
   project: ProjectSummary;
@@ -292,6 +316,20 @@ export async function listStandaloneConversations(): Promise<ConversationMeta[]>
   return data.items || [];
 }
 
+export interface NavigationData {
+  projects: ProjectSummary[];
+  project_conversations: Record<string, ConversationMeta[]>;
+  standalone_conversations: ConversationMeta[];
+}
+
+export async function fetchNavigation(): Promise<NavigationData> {
+  const response = await fetch(`${api}/api/navigation`);
+  if (!response.ok) {
+    throw new Error(`Navigation API failed with status ${response.status}`);
+  }
+  return (await response.json()) as NavigationData;
+}
+
 export async function confirmProjectPlan(
   projectId: string,
   nodes: ProjectNode[]
@@ -331,10 +369,28 @@ export async function endConversation(conversationId: string): Promise<void> {
   }
 }
 
+export async function deleteConversation(conversationId: string): Promise<void> {
+  const response = await fetch(`${api}/api/conversations/${encodeURIComponent(conversationId)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    throw new Error(`Delete conversation failed with status ${response.status}`);
+  }
+}
+
+export async function deleteProject(projectId: string): Promise<void> {
+  const response = await fetch(`${api}/api/projects/${encodeURIComponent(projectId)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    throw new Error(`Delete project failed with status ${response.status}`);
+  }
+}
+
 export async function retryLastReply(
   conversationId: string,
   model?: string,
-  options?: { signal?: AbortSignal }
+  options?: { signal?: AbortSignal; thinking?: boolean }
 ): Promise<ChatApiResult> {
   const response = await fetch(`${api}/api/chat/retry`, {
     method: "POST",
@@ -343,7 +399,8 @@ export async function retryLastReply(
     },
     body: JSON.stringify({
       conversation_id: conversationId,
-      model
+      model,
+      thinking: options?.thinking ?? false,
     }),
     signal: options?.signal
   });
@@ -367,7 +424,7 @@ export async function retryLastReplyStream(
   onThinking?: (thinking: string) => void,
   onTool?: (tool: StreamToolPayload) => void,
   onToolInputRequired?: (event: ToolInputEvent) => void,
-  options?: { signal?: AbortSignal }
+  options?: { signal?: AbortSignal; thinking?: boolean }
 ): Promise<void> {
   const response = await fetch(`${api}/api/chat/retry/stream`, {
     method: "POST",
@@ -376,7 +433,8 @@ export async function retryLastReplyStream(
     },
     body: JSON.stringify({
       conversation_id: conversationId,
-      model
+      model,
+      thinking: options?.thinking ?? false,
     }),
     signal: options?.signal
   });
@@ -467,6 +525,7 @@ export interface RewindPayload {
   replacement_message: string;
   images?: string[];
   model?: string;
+  thinking?: boolean;
 }
 
 export async function rewindAndResend(
@@ -601,7 +660,7 @@ export async function submitToolResponse(
   answers: Array<{ question: string; answer: string }>,
   model: string | undefined,
   conversationId: string,
-  options?: { signal?: AbortSignal }
+  options?: { signal?: AbortSignal; thinking?: boolean }
 ): Promise<ChatApiResult> {
   const response = await fetch(`${api}/api/chat/tool-response`, {
     method: "POST",
@@ -611,6 +670,7 @@ export async function submitToolResponse(
       answers,
       model,
       conversation_id: conversationId,
+      thinking: options?.thinking ?? false,
     }),
     signal: options?.signal,
   });
@@ -634,7 +694,7 @@ export async function submitToolResponseStream(
   onError: (error: string) => void,
   onThinking?: (thinking: string) => void,
   onTool?: (tool: StreamToolPayload) => void,
-  options?: { signal?: AbortSignal }
+  options?: { signal?: AbortSignal; thinking?: boolean }
 ): Promise<void> {
   const response = await fetch(`${api}/api/chat/tool-response/stream`, {
     method: "POST",
@@ -644,6 +704,7 @@ export async function submitToolResponseStream(
       answers,
       model,
       conversation_id: conversationId,
+      thinking: options?.thinking ?? false,
     }),
     signal: options?.signal,
   });

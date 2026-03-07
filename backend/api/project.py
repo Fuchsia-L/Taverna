@@ -9,6 +9,7 @@ from core.project_manager import (
     confirm_project_plan,
     create_project,
     create_standalone_conversation,
+    delete_project,
     get_project,
     list_project_conversations,
     list_projects,
@@ -22,7 +23,7 @@ router = APIRouter()
 
 async def _get_default_user_id() -> str:
     async with SessionLocal() as db:
-        user = await db.scalar(select(User).where(User.name == "default"))
+        user = await db.scalar(select(User).where(User.name == "default").order_by(User.created_at.asc(), User.id.asc()))
         if user:
             return str(user.id)
         new_user = User(name="default")
@@ -153,6 +154,42 @@ async def list_conversations_api(project_id: str | None = Query(default=None)):
         }
 
 
+def _serialize_conversation(item: Conversation) -> dict:
+    result = {
+        "id": str(item.id),
+        "type": item.type.value,
+        "title": item.title,
+        "objective": item.objective,
+        "node_id": item.node_id,
+        "status": item.status.value,
+    }
+    if item.created_at:
+        result["created_at"] = item.created_at.isoformat()
+    return result
+
+
+@router.get("/navigation")
+async def navigation_api():
+    """Single endpoint returning all projects, their conversations, and standalone conversations."""
+    user_id = await _get_default_user_id()
+    async with SessionLocal() as db:
+        projects = await list_projects(db, user_id)
+        project_conversations: dict[str, list[dict]] = {}
+        for project in projects:
+            convs = await list_project_conversations(db, project["id"])
+            project_conversations[project["id"]] = [_serialize_conversation(c) for c in convs]
+        standalone_query = select(Conversation).where(
+            Conversation.project_id.is_(None)
+        ).order_by(Conversation.created_at.asc())
+        standalone_rows = list(await db.scalars(standalone_query))
+        standalone = [_serialize_conversation(c) for c in standalone_rows]
+    return {
+        "projects": projects,
+        "project_conversations": project_conversations,
+        "standalone_conversations": standalone,
+    }
+
+
 @router.post("/conversations/{conversation_id}/end")
 async def end_conversation_api(conversation_id: str):
     async with SessionLocal() as db:
@@ -166,3 +203,48 @@ async def end_conversation_api(conversation_id: str):
         conversation.status = ConversationStatus.completed
         await db.commit()
         return {"status": "ok", "conversation_id": str(conversation.id)}
+
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_conversation_api(conversation_id: str):
+    from core.concurrency import conversation_guard, _conversation_locks
+    from core.conversation import delete_conversation
+    from core.pending_tools import _pending_tools_fallback, clear_pending_tool
+
+    try:
+        UUID(conversation_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid conversation_id") from exc
+
+    async with conversation_guard(conversation_id):
+        await clear_pending_tool(conversation_id)
+        deleted = await delete_conversation(conversation_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+    _pending_tools_fallback.pop(conversation_id, None)
+    _conversation_locks.pop(conversation_id, None)
+
+    return {"status": "ok", "conversation_id": conversation_id}
+
+
+@router.delete("/projects/{project_id}")
+async def delete_project_api(project_id: str):
+    from core.concurrency import _conversation_locks
+    from core.conversation import _debug_turns
+    from core.pending_tools import _pending_tools_fallback
+
+    user_id = await _get_default_user_id()
+
+    async with SessionLocal() as db:
+        try:
+            deleted_conv_ids = await delete_project(db, project_id=project_id, user_id=user_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    for conv_id in deleted_conv_ids:
+        _debug_turns.pop(conv_id, None)
+        _pending_tools_fallback.pop(conv_id, None)
+        _conversation_locks.pop(conv_id, None)
+
+    return {"status": "ok", "project_id": project_id, "deleted_conversations": len(deleted_conv_ids)}

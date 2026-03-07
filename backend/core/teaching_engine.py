@@ -9,6 +9,7 @@ from typing import Optional
 from uuid import UUID
 
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 
 from db.models import TeachingPlan as TeachingPlanModel
 from db.session import SessionLocal
@@ -93,7 +94,16 @@ async def _upsert_plan(conversation_id: str, plan: TeachingPlan) -> TeachingPlan
             row.plan = payload
         else:
             db.add(TeachingPlanModel(conversation_id=conv_uuid, plan=payload))
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            existing = await db.scalar(select(TeachingPlanModel).where(TeachingPlanModel.conversation_id == conv_uuid))
+            if existing:
+                existing.plan = payload
+                await db.commit()
+            else:
+                raise
     return plan
 
 

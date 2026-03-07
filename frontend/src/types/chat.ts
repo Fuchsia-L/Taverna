@@ -18,6 +18,18 @@ export interface ToolInputEvent {
   phase_id?: number;
 }
 
+export interface PlanCardNode {
+  id: string;
+  title: string;
+  objective: string;
+  status?: "pending" | "active" | "completed";
+}
+
+export interface PlanCardData {
+  nodes: PlanCardNode[];
+  projectId: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: ChatRole;
@@ -33,4 +45,6 @@ export interface ChatMessage {
   toolCard?: ToolInputEvent;
   toolCardSubmitted?: boolean;
   toolAnswers?: Array<{ question: string; answer: string }>;
+  planCard?: PlanCardData;
+  planCardConfirmed?: boolean;
 }
